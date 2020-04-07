@@ -3,7 +3,12 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 16
 VisualStudioVersion = 16.0.29926.136
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Lithe", "Lithe\Lithe.fsproj", "{EDE921F9-1B6E-4D31-816A-BC359EC591E3}"
+Project("{6EC3EE1D-3C4E-46DD-8F32-0CC8E7565705}") = "Lithe", "Lithe\Lithe.fsproj", "{EDE921F9-1B6E-4D31-816A-BC359EC591E3}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{E6C4B32D-50FB-4A2A-99AD-C07ECD554D91}"
+	ProjectSection(SolutionItems) = preProject
+		readme.md = readme.md
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
