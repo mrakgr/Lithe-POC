@@ -1,4 +1,4 @@
-﻿module Try1
+﻿module VaryTheBackground.Try2
 
 open System
 open System.Windows
@@ -15,13 +15,14 @@ let prop s v c = Observable.subscribe (s c) v |> ignore
 let event s f c = (s c : IEvent<_,_>).Add (f c)
 
 let w =
-    let brush = SolidColorBrush(Colors.Black)
+    let color = Subject.broadcast
 
     control Window [
         prop' (fun c v -> c.Height <- v) 400.0
         prop' (fun c v -> c.Width <- v) 400.0
         prop' (fun c v -> c.WindowStartupLocation <- v) WindowStartupLocation.CenterScreen
-        prop' (fun c v -> c.Background <- v) brush
+        prop' (fun c v -> c.Background <- v) (SolidColorBrush(Colors.Black))
+        prop (fun c v -> (c.Background :?> SolidColorBrush).Color <- v) color
         event (fun c -> c.MouseMove) (fun c args ->
             let width = c.ActualWidth - 2.0 * SystemParameters.ResizeFrameVerticalBorderWidth
             let height = c.ActualHeight - 2.0 * SystemParameters.ResizeFrameHorizontalBorderHeight - SystemParameters.CaptionHeight
@@ -32,9 +33,11 @@ let w =
             let angle = atan2 vectMouse.Y vectMouse.X
             let vectEclipse = Vector(width / 2.0 * (cos angle), height / 2.0 * (sin angle))
             let byLevel = 255.0 * (1.0 - min 1.0 (vectMouse.Length / vectEclipse.Length)) |> byte
-            brush.Color <- Color.FromRgb(byLevel,byLevel,byLevel)
+            color.OnNext <| Color.FromRgb(byLevel,byLevel,byLevel)
             )
         ]
 
 [<STAThread>]
 let main _ = Application().Run(w)
+
+
