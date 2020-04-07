@@ -1,4 +1,6 @@
-﻿open System
+﻿module Try1
+
+open System
 open System.Windows
 open System.Windows.Input
 open System.Windows.Controls
@@ -20,11 +22,11 @@ let w =
         prop' (fun c v -> c.Width <- v) 400.0
         prop' (fun c v -> c.WindowStartupLocation <- v) WindowStartupLocation.CenterScreen
         prop' (fun c v -> c.Background <- v) brush
-        event (fun c -> c.MouseMove) (fun t args ->
-            let width = t.ActualWidth - 2.0 * SystemParameters.ResizeFrameVerticalBorderWidth
-            let height = t.ActualHeight - 2.0 * SystemParameters.ResizeFrameHorizontalBorderHeight - SystemParameters.CaptionHeight
+        event (fun c -> c.MouseMove) (fun c args ->
+            let width = c.ActualWidth - 2.0 * SystemParameters.ResizeFrameVerticalBorderWidth
+            let height = c.ActualHeight - 2.0 * SystemParameters.ResizeFrameHorizontalBorderHeight - SystemParameters.CaptionHeight
 
-            let ptMouse = args.GetPosition(t)
+            let ptMouse = args.GetPosition(c)
             let ptCenter = Point(width/2.0, height/2.0)
             let vectMouse = ptMouse - ptCenter
             let angle = atan2 vectMouse.Y vectMouse.X
@@ -34,6 +36,5 @@ let w =
             )
         ]
 
-[<STAThread>] 
-[<EntryPoint>]
+[<STAThread>]
 let main _ = Application().Run(w)
