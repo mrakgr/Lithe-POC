@@ -4,9 +4,11 @@ open System
 open System.Windows
 open System.Windows.Controls
 
+open System.Reactive
 open System.Reactive.Linq
 open System.Reactive.Disposables
 open FSharp.Control.Reactive
+open System.Reactive.Concurrency
 
 let control c l = 
     Observable.Create (fun (sub : IObserver<_>) ->
@@ -24,6 +26,8 @@ let w =
         prop (fun t v -> t.Content <- v) <| control StackPanel [
             do' (fun pan ->
                 Observable.range 0 10
+                |> Observable.subscribeOn ThreadPoolScheduler.Instance
+                |> Observable.observeOn (Application.Current.Dispatcher |> Threading.DispatcherSynchronizationContext |> SynchronizationContextScheduler)
                 |> Observable.subscribe (fun x -> pan.Children.Add(Button(Content=sprintf "Button %i" x)) |> ignore)
                 |> ignore
                 )
@@ -32,4 +36,7 @@ let w =
 
 [<STAThread>]
 [<EntryPoint>]
-let main _ = w.Subscribe (Application().Run >> ignore); 0
+let main _ = 
+    let a = Application()
+    use __ = w.Subscribe (fun w -> a.MainWindow <- w; w.Show())
+    a.Run()
