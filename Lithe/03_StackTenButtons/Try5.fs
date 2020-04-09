@@ -24,19 +24,19 @@ let control' c l = control c l :?> IObservable<UIElement>
     
 let do' f c = f c; Disposable.Empty
 let prop s v c = Observable.subscribe (s c) v
-let event s f c = (s c : IEvent<_,_>).Subscribe(fun v -> f v)
-let children clear add set (v1 : IObservable<IObservable<IObservable<_>>>) c =
+let event s f c = (s c : IEvent<_,_>).Subscribe(fun v -> f c v)
+let children clear add set (v1 : IObservable<IObservable<IObservable<_>>>) c = // Note: The previous versions of this have bugs.
     let v2_disp = new SerialDisposable()
     new CompositeDisposable(
         v1.Subscribe(fun v2 ->
             clear c
             v2_disp.Disposable <- 
-                let v3_disp = new SerialDisposable()
+                let v3_disp = new CompositeDisposable()
                 let mutable i = 0
                 new CompositeDisposable(
                     v2.Subscribe (fun v3 ->
                         let i' = i
-                        v3_disp.Disposable <- v3.Subscribe (fun v -> if i' < i then set c i v else i <- add c v) // TODO: Fix this.
+                        v3_disp.Add <| v3.Subscribe (fun v -> if i' < i then set c i v else i <- add c v)
                         ),
                     v3_disp
                     )
@@ -45,7 +45,16 @@ let children clear add set (v1 : IObservable<IObservable<IObservable<_>>>) c =
         )
     :> IDisposable
 
-let children' clear add set v1 c = children clear add set (v1 |> Observable.ofSeq |> Observable.single) c
+//let children' clear add set v1 c = children clear add set (v1 |> Observable.ofSeq |> Observable.single) c // Alternative implementation.
+let children' add set (l : IObservable<_> list) c =
+    let v3_disp = new CompositeDisposable()
+    let mutable i = 0
+    l |> List.iter (fun v3 ->
+        let i' = i
+        v3_disp.Add <| v3.Subscribe (fun v -> if i' < i then set c i v else i <- add c v)
+        )
+    v3_disp :> IDisposable
+
 
 type Messages =
     | SliderChanged of int
@@ -56,13 +65,14 @@ let rng = Random()
 let create_buttons n =
     Observable.range 0 n
     |> Observable.map (fun i ->
-        control Button [do' (fun btn ->
-            btn.Margin <- Thickness 2.0
-            btn.Name <- 'A' + char i |> string
-            btn.FontSize <- rng.Next(10) |> float |> (+) btn.FontSize
-            btn.Content <- sprintf "Button %s says click me!" btn.Name
-            btn.Click.Add(fun args -> MessageBox.Show(sprintf "Button %s has been clicked!" btn.Name,"Button Click") |> ignore)
-            )]
+        control Button [
+            do' (fun btn ->
+                btn.Margin <- Thickness 2.0
+                btn.Name <- 'A' + char i |> string
+                btn.FontSize <- rng.Next(10) |> float |> (+) btn.FontSize
+                btn.Content <- sprintf "Button %s says click me!" btn.Name)
+            event (fun btn -> btn.Click) (fun btn args -> MessageBox.Show(sprintf "Button %s has been clicked!" btn.Name,"Button Click") |> ignore)
+            ]
         )
 
 let pump = Subject.broadcast
@@ -96,13 +106,14 @@ let view =
                 pan.Background <- Brushes.Aquamarine
                 pan.Margin <- Thickness 10.0
                 )
-            children' (fun pan -> pan.Children.Clear()) (fun pan -> pan.Children.Add) (fun pan i v -> pan.Children.[i] <- v) [
+            children' (fun pan -> pan.Children.Add) (fun pan i v -> pan.Children.[i] <- v) [
                 control' Slider [
                     do' (fun sld -> 
+                        sld.IsSnapToTickEnabled <- true
                         sld.Minimum <- 0.0
                         sld.Maximum <- 10.0
                         )
-                    event (fun sld -> sld.ValueChanged) (fun x -> dispatch (SliderChanged (int x.NewValue)))
+                    event (fun sld -> sld.ValueChanged) (fun _ x -> dispatch (SliderChanged (int x.NewValue)))
                     ]
                 control' StackPanel [
                     do' (fun pan ->
@@ -116,7 +127,6 @@ let view =
     ]
 
 [<STAThread>]
-[<EntryPoint>]
 let main _ = 
     let a = Application()
     use __ = view.Subscribe (fun w -> a.MainWindow <- w; w.Show())
