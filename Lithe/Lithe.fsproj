@@ -13,6 +13,9 @@
     <Compile Include="02_ClickTheButton\Try1.fs" />
     <Compile Include="03_StackTenButtons\Try1.fs" />
     <Compile Include="03_StackTenButtons\Try2.fs" />
+    <Compile Include="03_StackTenButtons\Try3.fs" />
+    <Compile Include="03_StackTenButtons\Try4.fs" />
+    <Compile Include="03_StackTenButtons\Try5.fs" />
   </ItemGroup>
 
   <ItemGroup>

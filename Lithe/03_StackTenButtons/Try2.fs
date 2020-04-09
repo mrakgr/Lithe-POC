@@ -35,7 +35,6 @@ let w =
         ]
 
 [<STAThread>]
-[<EntryPoint>]
 let main _ = 
     let a = Application()
     use __ = w.Subscribe (fun w -> a.MainWindow <- w; w.Show())
