@@ -1,4 +1,4 @@
-﻿module CounterApp
+﻿module CounterApp.Try1
 
 open System
 open System.Windows
@@ -81,13 +81,19 @@ let update =
         )
     |> Observable.startWith [init]
 
-let timerCmd() =
+let cmd_timer =
     update
-    |> Observable.map (fun x -> x.TimerOn)
-    |> Observable.distinctUntilChanged
-    |> Observable.combineLatest (Observable.interval(TimeSpan.FromSeconds(1.0)))
-    |> Observable.subscribe (fun (_,timerOn) -> 
-        if timerOn then Application.Current.Dispatcher.Invoke(fun () -> dispatch TimedTick)
+    |> Observable.distinctUntilChangedKey (fun x -> x.TimerOn)
+    |> Observable.map (fun model ->
+        if model.TimerOn then Observable.interval(TimeSpan.FromSeconds(1.0)) |> Observable.map (fun _ -> TimedTick)
+        else Observable.empty
+        )
+    |> Observable.switch
+
+let cmd() =
+    Observable.mergeSeq [cmd_timer] // If there was more than one command handler I'd merge them here.
+    |> Observable.subscribe (fun x -> 
+        Application.Current.Dispatcher.Invoke(fun () -> dispatch x)
         )
 
 let view =
@@ -141,5 +147,5 @@ let view =
 let main _ = 
     let a = Application()
     use __ = view.Subscribe (fun w -> a.MainWindow <- w; w.Show())
-    use __ = timerCmd()
+    use __ = cmd()
     a.Run()
