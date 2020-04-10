@@ -17,6 +17,9 @@
     <Compile Include="03_StackTenButtons\Try4.fs" />
     <Compile Include="03_StackTenButtons\Try5.fs" />
     <Compile Include="03_StackTenButtons\Try6.fs" />
+    <Compile Include="04_ABasicExample\ABasicExample.fs" />
+    <Compile Include="05_CounterApp\CounterApp.fs" />
+    <Compile Include="Main.fs" />
   </ItemGroup>
 
   <ItemGroup>

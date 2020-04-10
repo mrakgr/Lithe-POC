@@ -1,15 +1,12 @@
-﻿module StackTenButtons.Try6
+﻿module ABasicExample
 
 open System
 open System.Windows
 open System.Windows.Controls
 
-open System.Reactive
 open System.Reactive.Linq
 open System.Reactive.Disposables
 open FSharp.Control.Reactive
-open System.Reactive.Concurrency
-open System.Windows.Media
 
 /// Subscribers
 let do' f c = f c; Disposable.Empty
@@ -51,69 +48,36 @@ let stack_panel' props childs = control StackPanel (List.append props [fun c -> 
 let stack_panel props childs = stack_panel' props (Observable.ofSeq childs |> Observable.single)
 let window props content = control' Window (List.append props [prop (fun t v -> t.Content <- v) content])
 
-type Messages =
-    | SliderChanged of int
+/// The example
 
-type Model = {num_buttons : int }
+type Msg =
+    | Pressed
+
+type Model = {Pressed : bool }
+
+let init = {Pressed=false}
 
 let pump = Subject.broadcast
 let dispatch msg = pump.OnNext msg
 let update =
-    let init_model = {num_buttons=0}
     pump
-    |> Observable.scanInit init_model (fun model msg ->
+    |> Observable.scanInit init (fun model msg ->
         match msg with
-        | SliderChanged(n) -> {model with num_buttons=n}
+        | Pressed -> {model with Pressed=true}
         )
-    |> Observable.startWith [init_model]
-
-let rng = Random()
-let create_buttons n =
-    Observable.range 0 n
-    |> Observable.map (fun i ->
-        control' Button [
-            do' (fun btn ->
-                btn.Margin <- Thickness 2.0
-                btn.Name <- 'A' + char i |> string
-                btn.FontSize <- rng.Next(10) |> float |> (+) btn.FontSize
-                btn.Content <- sprintf "Button %s says click me!" btn.Name)
-            event (fun btn -> btn.Click) (fun btn args -> MessageBox.Show(sprintf "Button %s has been clicked!" btn.Name,"Button Click") |> ignore)
-            ]
-        )
+    |> Observable.startWith [init]
 
 let view =
-    window [
-        do' (fun t ->
-            t.MinHeight <- 300.0
-            t.MinWidth <- 300.0
-            t.WindowStartupLocation <- WindowStartupLocation.CenterScreen
-            t.SizeToContent <- SizeToContent.WidthAndHeight
-            t.Title <- "Stack Ten Buttons"
-            )
-        ]
-    <| stack_panel [
-        do' (fun pan ->
-            pan.Background <- Brushes.Aquamarine
-            pan.Margin <- Thickness 10.0
-            )
-        ] [
-        control Slider [
-            do' (fun sld -> 
-                sld.IsSnapToTickEnabled <- true
-                sld.Minimum <- 0.0
-                sld.Maximum <- 10.0
+    window [ do' (fun t -> t.Title <- "A Basic Example")]
+    <| stack_panel [] [
+            update
+            |> Observable.bind (fun model ->
+                if model.Pressed then control Label [do' (fun lbl -> lbl.Content <- "I was pressed")]
+                else control Button [
+                    do' (fun btn -> btn.Content <- "Press me!")
+                    event (fun btn -> btn.Click) (fun btn args -> dispatch Pressed)
+                    ]
                 )
-            event (fun sld -> sld.ValueChanged) (fun _ x -> dispatch (SliderChanged (int x.NewValue)))
-            ]
-
-        stack_panel' [
-            do' (fun pan ->
-                pan.Background <- Brushes.Red
-                pan.Margin <- Thickness 20.0)
-            ] (update
-                |> Observable.map (fun model -> model.num_buttons)
-                |> Observable.distinctUntilChanged
-                |> Observable.map create_buttons)
         ]
 
 [<STAThread>]
