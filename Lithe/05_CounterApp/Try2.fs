@@ -86,7 +86,7 @@ let update_cmd =
         | TimerToggled on -> { model with TimerOn = on }, (if on then [ TickTimer ] else [])
         | TimedTick -> if model.TimerOn then { model with Count = model.Count + model.Step }, [ TickTimer ] else model, [] 
         )
-    |> Observable.startWith [init]
+    |> Observable.publishInitial init
 
 let update = Observable.map fst update_cmd
 
@@ -159,4 +159,5 @@ let main _ =
     let a = Application()
     use __ = view.Subscribe (fun w -> a.MainWindow <- w; w.Show())
     use __ = cmd()
+    use __ = update.Connect()
     a.Run()

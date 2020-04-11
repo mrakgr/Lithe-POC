@@ -1,8 +1,4 @@
 ﻿module Main
-
-open System
-open FSharp.Control.Reactive
-
 open System
 
 [<STAThread>]
