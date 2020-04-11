@@ -159,5 +159,5 @@ let main _ =
     let a = Application()
     use __ = view.Subscribe (fun w -> a.MainWindow <- w; w.Show())
     use __ = cmd()
-    use __ = update.Connect()
+    use __ = update_cmd.Connect()
     a.Run()
