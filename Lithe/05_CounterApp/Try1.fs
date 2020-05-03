@@ -5,6 +5,7 @@ open System.Windows
 open System.Windows.Controls
 open System.Windows.Media
 
+open System.Reactive.Concurrency
 open System.Reactive.Linq
 open System.Reactive.Disposables
 open FSharp.Control.Reactive
@@ -67,7 +68,7 @@ type Msg =
 let init = { Count = 0; Step = 1; TimerOn=false }
 
 let pump = Subject.broadcast
-let dispatch msg = pump.OnNext msg
+let dispatch msg = CurrentThreadScheduler.Instance.Schedule(fun () -> pump.OnNext msg) |> ignore
 let update =
     pump
     |> Observable.scanInit init (fun model msg ->

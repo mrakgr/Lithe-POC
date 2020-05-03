@@ -8,6 +8,7 @@ open System.Windows
 open System.Windows.Controls
 open System.Windows.Media
 
+open System.Reactive.Concurrency
 open System.Reactive.Linq
 open System.Reactive.Disposables
 open FSharp.Control.Reactive
@@ -73,7 +74,9 @@ type CmdMsg =
 let init = { Count = 0; Step = 1; TimerOn=false }
 
 let pump = Subject.broadcast
-let dispatch msg = pump.OnNext msg
+// Using the CurrentThreadScheduler is needed to guarantee that the messages get executed in the right order.
+// Not for this example, but in a general sense.
+let dispatch msg = CurrentThreadScheduler.Instance.Schedule (fun () -> pump.OnNext msg) |> ignore
 let update_cmd =
     let init = init, []
     pump
