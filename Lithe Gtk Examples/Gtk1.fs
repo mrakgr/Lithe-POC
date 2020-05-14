@@ -122,17 +122,16 @@ let try_view' () =
     use box2 = new VBox (false, 0)
     box1.Add box2
  
-    //use radiobutton = new RadioButton(null : RadioButton)
-    //radiobutton.Label <- "button 1"
-    //use radiobutton2 = new RadioButton(radiobutton)
-    //radiobutton2.Label <- "button 2";  radiobutton2.Active <- true
-    //use radiobutton3 = new RadioButton(radiobutton)
-    //radiobutton3.Label <- "button 3"
-    //radiobutton2.Active <- true
+    use radiobutton = new RadioButton(null : RadioButton)
+    radiobutton.Label <- "button 1"
+    use radiobutton2 = new RadioButton(radiobutton)
+    radiobutton2.Label <- "button 2";  radiobutton2.Active <- true
+    use radiobutton3 = new RadioButton(radiobutton)
+    radiobutton3.Label <- "button 3"
     
-    //box2.Add(radiobutton)
-    //box2.Add(radiobutton2)
-    //box2.Add(radiobutton3)
+    box2.Add(radiobutton)
+    box2.Add(radiobutton2)
+    box2.Add(radiobutton3)
  
     use separator = new HSeparator ()
     box1.Add(separator)
@@ -161,7 +160,7 @@ let try_view() =
     use __ = view().Subscribe(fun x -> printfn "Showing..."; x.ShowAll())
     Application.Run()
 
-[<EntryPoint>]
+//[<EntryPoint>]
 let main _ =
     try_view ()
     0
