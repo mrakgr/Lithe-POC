@@ -91,6 +91,7 @@ let create_buttons n =
         do' (fun btn ->
             btn.Margin <- 2
             btn.Name <- 'A' + char (i - 1) |> string
+            // I wanted to change the font here, but this is actually difficult in Gtk.
             btn.Label <- sprintf "Button %s says click me!" btn.Name)
         ])
 
