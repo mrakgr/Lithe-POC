@@ -3,15 +3,17 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>netcoreapp3.1</TargetFramework>
-    <RootNamespace>ZeroMQ_Examples</RootNamespace>
+    <RootNamespace>Lithe_Avalonia_Examples</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="File1.fs" />
+    <Compile Include="Hello World.fs" />
+    <Compile Include="Avalonia1.fs" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="FSharp.Control.Reactive" Version="4.2.0" />
+    <PackageReference Include="Avalonia" Version="0.9.10" />
+    <PackageReference Include="Avalonia.Desktop" Version="0.9.10" />
     <PackageReference Include="System.Reactive" Version="4.4.1" />
   </ItemGroup>
 
