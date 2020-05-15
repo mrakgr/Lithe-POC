@@ -2,7 +2,7 @@
 
 A successful proof of concept implementation of the MVU (Elm) pattern using just reactive extensions. Check out the [early April 2020 commits](https://github.com/mrakgr/The-Spiral-Language/commit/47548e25f149ad3179fe7d6f243bd0e80e7299f8) on the Spiral language repo for a blow by blow account of what I was trying to do here.
 
-All the examples here use WPF + .NET Core 3.1.
+The examples in the `Lithe` project folder use WPF + .NET Core 3.1.
 
 ## Writeup
 
