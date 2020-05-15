@@ -24,7 +24,9 @@ Today there are like UI libraries like Fabulous, but even so since there is no n
 
 To me this is a confirmation that the subject of functional reactive programming is worth studying. Here I gave it a try at creating a smallish UI library in order to redeem myself for my poor 2016 performance at making UIs, but in the future I will be bringing these techniques to bear on doing editor support for the Spiral language. Having access to an UI library like Fabulous would not be useful for that, but with some effort I might be able to reuse the MVU pattern using reactive combinators even in such a vastly different domain. If that turns out to be a success, it will all be thanks to me going through the motions that I did here.
 
-Update 5/15/2020: Gtk and Avalonia examples have been added in their respective project folders.
+---
+
+**Update 5/15/2020**: Gtk and Avalonia examples have been added in their respective project folders.
 
 As a short review, between the two Avalonia is the one you should use. The primary reason is Gtk is really bad at doing dynamic layouts and is really finicky about the order the controls get added to their parents. I actually couldn't use the usual design and had to CPS it another level. Even then, the framework still feels broken. In addition to having to dispose of the controls manually as they are native, none of the bindings have descriptions. Doing elementary things like changing the font size is something I could not figure out how to do in Gtk. Also all the Widgets are a pain to use as they take special constructor arguments which adds further difficult in creating reactive abstractions for it. It is an ancient piece of crap.
 
