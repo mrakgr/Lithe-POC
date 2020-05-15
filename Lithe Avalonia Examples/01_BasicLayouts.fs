@@ -4,7 +4,7 @@
 
 // The scheduler, synchronization context and the dispatcher are in Avalonia.Threading.
 // I'll make use of that in the next example.
-module Avalania.Try1
+module Avalonia.BasicLayouts
 
 module UI =
     open Avalonia
@@ -118,5 +118,4 @@ module Main =
     [<CompiledName "BuildAvaloniaApp">] 
     let buildAvaloniaApp () = AppBuilder.Configure<App>().UsePlatformDetect().LogToDebug()
 
-    [<STAThread>][<EntryPoint>]
     let main argv = buildAvaloniaApp().StartWithClassicDesktopLifetime(argv)

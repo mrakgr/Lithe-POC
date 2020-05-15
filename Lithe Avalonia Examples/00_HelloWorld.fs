@@ -1,4 +1,4 @@
-﻿module StarterTemplate
+﻿module Avalonia.HelloWorld
 
 open Avalonia.Controls
 open Avalonia.Layout
@@ -39,5 +39,4 @@ open Avalonia.Logging.Serilog
 let buildAvaloniaApp () = 
     AppBuilder.Configure<App>().UsePlatformDetect().LogToDebug()
 
-[<STAThread>]
 let main argv = buildAvaloniaApp().StartWithClassicDesktopLifetime(argv)

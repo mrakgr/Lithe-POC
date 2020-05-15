@@ -7,8 +7,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="Hello World.fs" />
-    <Compile Include="Avalonia1.fs" />
+    <Compile Include="00_HelloWorld.fs" />
+    <Compile Include="01_BasicLayouts.fs" />
+    <Compile Include="02_Counter.fs" />
+    <Compile Include="03_StackButtons.fs" />
+    <Compile Include="Main.fs" />
   </ItemGroup>
 
   <ItemGroup>

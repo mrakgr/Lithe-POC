@@ -1,6 +1,6 @@
 ﻿// Does not give correct results. Unlike WPF, Gtk requires that the subcontainers be added right away.
 // I will have to CPS this.
-module Gtk.Try1
+module Gtk.Counter.Try1
 
 open System
 open Gtk
@@ -113,7 +113,7 @@ let view () =
         event (fun c -> c.DeleteEvent) (fun _ _ -> Application.Quit())
         ]
 
-let try_view' () =
+let main' =
     Application.Init()
     let window = new Window(null)
     use box1 = new VBox (false, 0)
@@ -155,12 +155,9 @@ let try_view' () =
     Application.Run()
     0
 
-let try_view() =
+let main _ =
     Application.Init()
     use __ = view().Subscribe(fun x -> printfn "Showing..."; x.ShowAll())
     Application.Run()
-
-//[<EntryPoint>]
-let main _ =
-    try_view ()
     0
+

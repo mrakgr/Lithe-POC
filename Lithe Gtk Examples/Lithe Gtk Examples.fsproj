@@ -7,9 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="Gtk1.fs" />
-    <Compile Include="Gtk2.fs" />
-    <Compile Include="Gtk3.fs" />
+    <Compile Include="01_Counter.fs" />
+    <Compile Include="02_Counter.fs" />
+    <Compile Include="03_StackButtons.fs" />
+    <Compile Include="Main.fs" />
   </ItemGroup>
 
   <ItemGroup>
