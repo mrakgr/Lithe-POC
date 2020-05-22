@@ -14,6 +14,13 @@ module Lithe =
     open System.Reactive.Subjects
     open FSharp.Control.Reactive
 
+    let subscribe_composite (f : 'a -> #IDisposable) (x : 'a IObservable) =
+        let d = new CompositeDisposable()
+        new CompositeDisposable(x.Subscribe(fun x -> d.Add(f x)), d) :> IDisposable
+    let subscribe_serial (f : 'a -> #IDisposable) (x : 'a IObservable) =
+        let d = new SerialDisposable()
+        new CompositeDisposable(x.Subscribe(fun x -> d.Disposable <- f x), d) :> IDisposable
+
     let do' f c = f c; Disposable.Empty
     let prop s v c = Observable.subscribe (s c) v
     let prop_set (p : 'a AvaloniaProperty) (v : 'a IObservable) (c : #Control) = v.Subscribe(fun v -> c.SetValue(p,v))
@@ -23,22 +30,21 @@ module Lithe =
     let control<'a when 'a :> Control> (c : unit -> 'a) l = 
         Observable.Create (fun (obs : IObserver<_>) ->
             let c = c()
-            let d = Seq.map ((|>) c) l
+            let d = List.map ((|>) c) l
             obs.OnNext (c :> Control)
             new CompositeDisposable(d) :> IDisposable
             )
 
-    let children (l : Control IObservable seq) (c : #Panel) = 
+    let children (l : Control IObservable list) (c : #Panel) = 
         let c = c.Children
-        l |> Seq.mapi (fun i v -> v.Subscribe (fun v -> if i < c.Count then c.[i] <- v else c.Add v))
+        l |> List.mapi (fun i v -> v.Subscribe (fun v -> if i < c.Count then c.[i] <- v else c.Add v))
         |> fun x -> new CompositeDisposable(x) :> IDisposable
-    let items (l : (TabItem -> IDisposable) seq seq) (t : #TabControl) = 
+    let items (l : (TabItem -> IDisposable) list list) (t : #TabControl) = 
         let d = new CompositeDisposable()
         // t.Items <- x needs to come last otherwise selection won't work.
-        // Seq.toArray needs to be here in order to force evaluation.
-        l |> Seq.toArray |> Array.map (fun l -> 
+        l |> List.map (fun l -> 
             let x = TabItem()
-            Seq.iter ((|>) x >> d.Add) l
+            List.iter ((|>) x >> d.Add) l
             x)
         |> fun x -> t.Items <- x; d :> IDisposable
     let content v c = prop (fun (x : #ContentControl) v -> x.Content <- v) v c
@@ -60,24 +66,43 @@ module Lithe =
     let list_box l = control ListBox l
     let list_box_item l = control ListBoxItem l
     let empty = Observable.empty : Control IObservable
+    
     type GridUnit = A of float | S of float | P of float
-    let vert_grid (l' : (Grid -> IDisposable) seq) (l : (GridUnit * Control IObservable) seq) =
+    let private conv f = function A s -> f (s, GridUnitType.Auto) | S s -> f (s, GridUnitType.Star) | P s -> f (s, GridUnitType.Pixel)
+    let cd (l : GridUnit list) = let c = ColumnDefinitions() in List.iter (conv ColumnDefinition >> c.Add) l; c
+    let cd_set l = do' <| fun (x : #Grid) -> x.ColumnDefinitions <- cd l
+    let rd (l : GridUnit list) = let c = RowDefinitions() in List.iter (conv RowDefinition >> c.Add) l; c
+    let rd_set l = do' <| fun (x : #Grid) -> x.RowDefinitions <- rd l
+        
+    // Variable number of rows, fixed number of columns.
+    let vert_grid' (l' : (Grid -> IDisposable) list) (l : (GridUnit * #Control IObservable list) IObservable) =
         Observable.Create (fun (obs : _ IObserver) ->
             let c = Grid()
+
             let d = new CompositeDisposable()
-            Seq.iter ((|>) c >> d.Add) l'
-            l |> Seq.iteri (fun i (s, x) ->
-                let f a b = RowDefinition(a,b)
-                match s with A s -> f s GridUnitType.Auto | S s -> f s GridUnitType.Star | P s -> f s GridUnitType.Pixel
-                |> c.RowDefinitions.Add
-                x.Subscribe(fun x -> 
-                    if i < c.Children.Count then c.Children.[i] <- x else c.Children.Add(x)
-                    Grid.SetRow(x,i)
-                    ) |> d.Add
+            l' |> List.iter ((|>) c >> d.Add)
+            let i_row = ref 0
+            l |> subscribe_composite (fun (s, row) -> 
+                let incr x = let q = !x in incr x; q
+                let i_row = incr i_row
+                c.RowDefinitions.Add(conv RowDefinition s)
+
+                row |> List.mapi (fun i_col col ->
+                    let i_child = c.Children.Count
+                    col.Subscribe(fun x ->
+                        if i_child < c.Children.Count then c.Children.[i_child] <- x else c.Children.Add(x)
+                        Grid.SetRow(x,i_row); Grid.SetColumn(x,i_col)
+                        )
+                    )
+                |> fun x -> new CompositeDisposable(x)
                 )
+            |> d.Add
             obs.OnNext(c)
-            new CompositeDisposable(d) :> IDisposable
+            d :> IDisposable
             )
+
+    let vert_grid (l' : (Grid -> IDisposable) list) (l : (GridUnit * Control IObservable) list) =
+        vert_grid' l' (l |> List.map (fun (s,row) -> s, [row]) |> Observable.ofSeq)
 
 module Messaging =
     open System
@@ -88,11 +113,28 @@ module Messaging =
     open NetMQ.Sockets
     open System.Reactive.Disposables
 
+    let agent_template = 
+        let run f = let poller = new NetMQPoller() in poller, Task.Run(fun () -> f poller : unit)
+        let dispose state =
+            state |> Option.iter (fun l -> 
+                let pollers, tasks = Array.unzip l
+                pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
+                Task.WaitAll(tasks)
+                tasks |> Array.iter (fun x -> x.Dispose())
+                )
+        fun (l : (NetMQPoller -> unit) []) -> MailboxProcessor.Start(fun mailbox ->
+            let rec loop state = async {
+                let! () = mailbox.Receive()
+                dispose state
+                return! Array.map run l |> Some |> loop
+                }
+            loop None
+            )
+
     module HelloWorld =
-        module private Inner =
-            let uri = "ipc://hello-world"
-            let server (log : string -> unit) (poller: NetMQPoller) =
-                use server = new ResponseSocket()
+        let uri = "ipc://hello-world"
+        let server (log : string -> unit) (poller: NetMQPoller) =
+            try use server = new ResponseSocket()
                 poller.Add(server)
                 log <| sprintf "Server is binding to: %s" uri
                 server.Bind(uri)
@@ -107,9 +149,10 @@ module Messaging =
                     )
                 poller.Run()
                 server.Unbind(uri)
+            with e -> log e.Message
 
-            let client (log : string -> unit) (poller: NetMQPoller)  =
-                use client = new RequestSocket()
+        let client (log : string -> unit) (poller: NetMQPoller)  =
+            try use client = new RequestSocket()
                 poller.Add(client)
                 log <| sprintf "Client is connecting to: %s" uri
                 client.Connect(uri)
@@ -127,25 +170,8 @@ module Messaging =
                     )
                 poller.Run()
                 client.Disconnect(uri)
+            with e -> log e.Message
 
-            let run f log = let poller = new NetMQPoller() in poller, Task.Run(fun () -> try f log poller with e -> printfn "%A" e)
-            let dispose state =
-                state |> Option.iter (fun l -> 
-                    let pollers, tasks = Array.unzip l
-                    pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
-                    Task.WaitAll(tasks)
-                    )
-
-        open Inner
-        type Msg = Start of server_log : (string -> unit) * client_log : (string -> unit)
-        let agent = MailboxProcessor.Start(fun mailbox ->
-            let rec loop state = async {
-                let! (Start(server_log, client_log)) = mailbox.Receive()
-                dispose state
-                return! Some [|run server server_log; run client client_log|] |> loop
-                }
-            loop None
-            )
     
     //module Weather =
             
@@ -174,26 +200,34 @@ module UI =
         type Msg = AddServer of string | AddClient of string | StartExample
         type State = {server_count : int; client_count : int}
         let state_stream = new Subjects.ReplaySubject<_>(1,ui_scheduler)
+
+        open Messaging
         open Messaging.HelloWorld
-        let agent = MailboxProcessor.Start(fun mailbox ->
+        let agent_ui = MailboxProcessor.Start(fun mailbox ->
+            let agent_zeromq = agent_template [|client (AddServer >> mailbox.Post); server (AddClient >> mailbox.Post)|]
             let rec loop (model : State) = async {
-                let update (f : _ ISubject) i x = f.OnNext(sprintf "%i: %s" i x); i+1
+                let update (f : _ ISubject) i x = f.OnNext(i, x); i+1
                 state_stream.OnNext(model)
                 match! mailbox.Receive() with
                 | AddServer x -> return! loop {model with server_count=update server_stream model.server_count x}
                 | AddClient x -> return! loop {model with client_count=update client_stream model.client_count x}
-                | StartExample -> agent.Post(Start(AddServer >> mailbox.Post, AddClient >> mailbox.Post)); return! loop model
+                | StartExample -> agent_zeromq.Post(); return! loop model
                 }
             loop {server_count=0; client_count=0}
             )
-        let dispatch msg = agent.Post msg
+        let dispatch msg = agent_ui.Post msg
 
         let view = 
             let text_list obs =
                 border [
                     do' <| fun x -> x.BorderBrush <- Brushes.Black; x.BorderThickness <- Thickness 0.5
                     child <| scroll_viewer [
-                        content <| stack_panel [prop (fun x v -> x.Children.Add(TextBlock(Text=v))) obs]
+                        content <| vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(fun (i,x) ->
+                            A 1.0, [
+                                text_block [do' <| fun c -> c.Text <- sprintf "%i:" i; c.HorizontalAlignment <- HorizontalAlignment.Right]
+                                text_block [do' <| fun c -> c.Text <- x]
+                                ]
+                            ))
                         prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) obs
                         ]
                     ]
