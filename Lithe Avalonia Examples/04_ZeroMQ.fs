@@ -22,6 +22,7 @@ module Lithe =
         new CompositeDisposable(x.Subscribe(fun x -> d.Disposable <- f x), d) :> IDisposable
 
     let do' f c = f c; Disposable.Empty
+    let connect (v : _ IObservable) c = v.Subscribe()
     let prop s v c = Observable.subscribe (s c) v
     let prop_set (p : 'a AvaloniaProperty) (v : 'a IObservable) (c : #Control) = v.Subscribe(fun v -> c.SetValue(p,v))
     let prop_change<'a,'c when 'c :> Control> (p : 'a AvaloniaProperty) f (c : 'c) = c.GetPropertyChangedObservable(p).Subscribe(fun x -> f c (x.NewValue :?> 'a))
@@ -111,24 +112,16 @@ module Messaging =
     open System.Threading.Tasks
     open NetMQ
     open NetMQ.Sockets
+    open System.Reactive
     open System.Reactive.Disposables
 
-    let agent_template = 
-        let run f = let poller = new NetMQPoller() in poller, Task.Run(fun () -> f poller : unit)
-        let dispose state =
-            state |> Option.iter (fun l -> 
-                let pollers, tasks = Array.unzip l
-                pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
-                Task.WaitAll(tasks)
-                tasks |> Array.iter (fun x -> x.Dispose())
-                )
-        fun (l : (NetMQPoller -> unit) []) -> MailboxProcessor.Start(fun mailbox ->
-            let rec loop state = async {
-                let! () = mailbox.Receive()
-                dispose state
-                return! Array.map run l |> Some |> loop
-                }
-            loop None
+    let run l =
+        let l = l |> Array.map (fun f -> let poller = new NetMQPoller() in poller, Task.Run(fun () -> f poller : unit))
+        Disposable.Create(fun () ->
+            let pollers, tasks = Array.unzip l
+            pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
+            Task.WaitAll(tasks)
+            tasks |> Array.iter (fun x -> x.Dispose())
             )
 
     module HelloWorld =
@@ -171,7 +164,6 @@ module Messaging =
                 poller.Run()
                 client.Disconnect(uri)
             with e -> log e.Message
-
     
     //module Weather =
             
@@ -197,44 +189,58 @@ module UI =
         let server_stream = Subject.Synchronize(Subject.broadcast,ui_scheduler)
         let client_stream = Subject.Synchronize(Subject.broadcast,ui_scheduler)
         
-        type Msg = AddServer of string | AddClient of string | StartExample
+        type Msg = AddServer of string | AddClient of string
+        type MsgStart = StartExample
         type State = {server_count : int; client_count : int}
-        let state_stream = new Subjects.ReplaySubject<_>(1,ui_scheduler)
+        // The ThreadPoolScheduler assigns a different thread for each subscription and 
+        // dispatches on them consistently for the lifetime of the subscription.
+        let msg_stream = Subject.Synchronize(Subject.broadcast,ThreadPoolScheduler.Instance)
 
         open Messaging
         open Messaging.HelloWorld
-        let agent_ui = MailboxProcessor.Start(fun mailbox ->
-            let agent_zeromq = agent_template [|client (AddServer >> mailbox.Post); server (AddClient >> mailbox.Post)|]
-            let rec loop (model : State) = async {
-                let update (f : _ ISubject) i x = f.OnNext(i, x); i+1
-                state_stream.OnNext(model)
-                match! mailbox.Receive() with
-                | AddServer x -> return! loop {model with server_count=update server_stream model.server_count x}
-                | AddClient x -> return! loop {model with client_count=update client_stream model.client_count x}
-                | StartExample -> agent_zeromq.Post(); return! loop model
-                }
-            loop {server_count=0; client_count=0}
-            )
-        let dispatch msg = agent_ui.Post msg
+            
+        let start_stream = Subject.Synchronize(Subject.broadcast,ThreadPoolScheduler.Instance)
+        let state =
+            let init = {server_count=0; client_count=0}
+            start_stream 
+            |> Observable.map (fun StartExample ->
+                Observable.using (fun () -> 
+                    run [|server (AddServer >> msg_stream.OnNext); client (AddClient >> msg_stream.OnNext)|]
+                    |> Disposable.compose (Disposable.Create(fun () -> server_stream.OnNext None; client_stream.OnNext None))
+                    ) <| fun _ ->
+                msg_stream |> Observable.scanInit init (fun model msg ->
+                    let update (f : _ ISubject) i x = f.OnNext(Some(i, x)); i+1
+                    match msg with
+                    | AddServer x -> {model with server_count=update server_stream model.server_count x}
+                    | AddClient x -> {model with client_count=update client_stream model.client_count x}
+                    )
+                )
+            |> Observable.switch
+            |> Observable.publishInitial init
+            |> Observable.refCount
+            |> Observable.observeOn ui_scheduler
 
         let view = 
             let text_list obs =
                 border [
                     do' <| fun x -> x.BorderBrush <- Brushes.Black; x.BorderThickness <- Thickness 0.5
                     child <| scroll_viewer [
-                        content <| vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(fun (i,x) ->
-                            A 1.0, [
-                                text_block [do' <| fun c -> c.Text <- sprintf "%i:" i; c.HorizontalAlignment <- HorizontalAlignment.Right]
-                                text_block [do' <| fun c -> c.Text <- x]
-                                ]
+                        content <| vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(function 
+                            | Some (i,x) ->
+                                A 1.0, [
+                                    text_block [do' <| fun c -> c.Text <- sprintf "%i:" i; c.HorizontalAlignment <- HorizontalAlignment.Right]
+                                    text_block [do' <| fun c -> c.Text <- x]
+                                    ]
+                            | None ->
+                                A 1.0, [text_block [do' <| fun c -> c.Text <- "-----"; Grid.SetColumnSpan(c,2)]]
                             ))
                         prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) obs
                         ]
                     ]
-            vert_grid [] [
+            vert_grid [connect state] [
                 A 1.0, button [
                     do' <| fun x -> x.Content <- "Run Server & Client"
-                    event (fun x -> x.Click) (fun _ _ -> dispatch StartExample)
+                    event (fun x -> x.Click) (fun _ _ -> start_stream.OnNext StartExample)
                     ]
                 A 1.0, text_block [do' <| fun x -> x.Text <- "Server:"]
                 S 1.0, text_list server_stream
@@ -275,7 +281,12 @@ module Main =
         override x.OnFrameworkInitializationCompleted() =
             match x.ApplicationLifetime with
             | :? IClassicDesktopStyleApplicationLifetime as desktop ->
-                UI.view.Add (fun v -> desktop.MainWindow <- v :?> Window)
+                let d = new Reactive.Disposables.SingleAssignmentDisposable()
+                d.Disposable <- UI.view.Subscribe (fun v -> 
+                    let v = v :?> Window
+                    desktop.MainWindow <- v
+                    v.Closing.Add(fun _ -> d.Dispose())
+                    )
             | _ -> ()
 
             base.OnFrameworkInitializationCompleted()
