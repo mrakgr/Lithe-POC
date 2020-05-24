@@ -15,6 +15,4 @@ open NetMQ
 open NetMQ.Sockets
 
 [<EntryPoint>]
-let main argv = 
-    //Avalonia.ZeroMQ.Main.main argv
-    Avalonia.StackButtons.Main.main argv
+let main argv = Avalonia.ZeroMQ.Main.main argv
