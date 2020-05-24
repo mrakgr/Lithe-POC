@@ -13,6 +13,7 @@ module UI =
     open System.Reactive.Disposables
     open System.Reactive.Concurrency
     open System.Reactive.Subjects
+    open FSharp.Control.Reactive
 
     /// Lithe
     let do' f c = f c; Disposable.Empty
@@ -55,7 +56,7 @@ module UI =
 
     let init = {num_buttons = 3}
 
-    let pump = Subject.Synchronize(Subject(), Avalonia.Threading.AvaloniaScheduler.Instance)
+    let pump = Subject.Synchronize(Subject.broadcast, Avalonia.Threading.AvaloniaScheduler.Instance)
     let dispatch msg = pump.OnNext msg
     let update =
         pump.Scan(init, fun model msg ->
@@ -127,7 +128,7 @@ module UI =
                         prop_change Slider.ValueProperty (fun _ x -> dispatch (SliderChanged (int x)))
                         ]
 
-                    num_buttons.SelectMany(fun x ->
+                    num_buttons |> Observable.switchMap(fun x ->
                         stack_panel [
                             do' <| fun pan -> pan.Background <- Brushes.Red; pan.Margin <- Thickness 20.0
                             children <| create_buttons x
