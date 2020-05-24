@@ -122,6 +122,7 @@ module Messaging =
             pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
             Task.WaitAll(tasks)
             tasks |> Array.iter (fun x -> x.Dispose())
+            pollers |> Array.iter (fun (x : NetMQPoller) -> x.Dispose())
             )
 
     module HelloWorld =
