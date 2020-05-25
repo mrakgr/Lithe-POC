@@ -1,17 +1,18 @@
-﻿module Avalonia.ZeroMQ
+﻿// The file after this is going to be a continuation of this one with the rest of the examples from the ZeroMQ guide.
+// That having said, this example is already 290 LOC so I am going to leave it here as an isolated fragment because
+// when the rest of the ZeroMQ examples come in, the size is going to bloat.
+
+// Here a broad range of reactive combinator functionality is being demonstrated in the context of doing GUIs.
+// In addition to that, how to start and dispose NetMQ servers and clients is demonstrated.
+module Avalonia.ZeroMQHelloWorld
 
 module Lithe = 
     open Avalonia
-    open Avalonia.Media
     open Avalonia.Controls
-    open Avalonia.Layout
 
     open System
-    open System.Reactive
     open System.Reactive.Linq
     open System.Reactive.Disposables
-    open System.Reactive.Concurrency
-    open System.Reactive.Subjects
     open FSharp.Control.Reactive
 
     let subscribe_composite (f : 'a -> #IDisposable) (x : 'a IObservable) =
@@ -42,7 +43,7 @@ module Lithe =
         |> fun x -> new CompositeDisposable(x) :> IDisposable
     let items (l : (TabItem -> IDisposable) list list) (t : #TabControl) = 
         let d = new CompositeDisposable()
-        // t.Items <- x needs to come last otherwise selection won't work.
+        // `t.Items <- x` needs to come last otherwise selection won't work.
         l |> List.map (fun l -> 
             let x = TabItem()
             List.iter ((|>) x >> d.Add) l
@@ -107,12 +108,10 @@ module Lithe =
 
 module Messaging =
     open System
-    open System.IO
     open System.Threading
     open System.Threading.Tasks
     open NetMQ
     open NetMQ.Sockets
-    open System.Reactive
     open System.Reactive.Disposables
 
     let run l =
@@ -121,8 +120,7 @@ module Messaging =
             let pollers, tasks = Array.unzip l
             pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
             Task.WaitAll(tasks)
-            tasks |> Array.iter (fun x -> x.Dispose())
-            pollers |> Array.iter (fun (x : NetMQPoller) -> x.Dispose())
+            (pollers, tasks) ||> Array.iter2 (fun a b -> a.Dispose(); b.Dispose())
             )
 
     module HelloWorld =
@@ -166,19 +164,12 @@ module Messaging =
                 client.Disconnect(uri)
             with e -> log e.Message
     
-    //module Weather =
-            
-
 module UI =
     open Lithe
     open Avalonia.Media
     open Avalonia.Controls
     open Avalonia.Layout
-    open Avalonia.Controls.Primitives
 
-    open System
-    open System.Reactive
-    open System.Reactive.Linq
     open System.Reactive.Disposables
     open System.Reactive.Concurrency
     open System.Reactive.Subjects
