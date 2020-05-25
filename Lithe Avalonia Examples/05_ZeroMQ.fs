@@ -1,10 +1,7 @@
-﻿// The file after this is going to be a continuation of this one with the rest of the examples from the ZeroMQ guide.
-// That having said, this example is already 290 LOC so I am going to leave it here as an isolated fragment because
-// when the rest of the ZeroMQ examples come in, the size is going to bloat.
+﻿module Avalonia.ZeroMQ
 
-// Here a broad range of reactive combinator functionality is being demonstrated in the context of doing GUIs.
-// In addition to that, how to start and dispose NetMQ servers and clients is demonstrated.
-module Avalonia.ZeroMQHelloWorld
+open System
+open System.Threading
 
 module Lithe = 
     open Avalonia
@@ -141,6 +138,7 @@ module Messaging =
                     )
                 poller.Run()
                 server.Unbind(uri)
+                poller.Remove(server)
             with e -> log e.Message
 
         let client (log : string -> unit) (poller: NetMQPoller)  =
@@ -156,12 +154,59 @@ module Messaging =
                         msg |> sprintf "Client sending %s" |> log 
                         client.SendFrame(msg)
                         incr i
+                    else 
+                        poller.Stop()
                     )
                 use __ = client.ReceiveReady.Subscribe(fun _ -> 
                     client.ReceiveFrameString() |> sprintf "Client received %s" |> log
                     )
                 poller.Run()
                 client.Disconnect(uri)
+                poller.Remove(client)
+            with e -> log e.Message
+
+    module Weather =
+        let uri = "ipc://weather"
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            try let rand = Random()
+                use pub = new PublisherSocket()
+                poller.Add(pub)
+                pub.Bind(uri)
+                log "Publisher has bound."
+                use __ = pub.SendReady.Subscribe(fun _ ->  
+                    // get values that will fool the boss
+                    let zipcode, temperature, relhumidity = rand.Next 100000, (rand.Next 215) - 80, (rand.Next 50) + 10
+                    sprintf "%05d %d %d" zipcode temperature relhumidity |> pub.SendFrame
+                    )
+                poller.Run()
+                pub.Unbind(uri)
+                poller.Remove(pub)
+            with e -> log e.Message
+
+        let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
+            try use sub = new SubscriberSocket()
+                poller.Add(sub)
+                sub.Connect(uri)
+                sub.Subscribe(filter)
+                log "Client has connected and subscribed."
+                let i = ref 0
+                let total_temp = ref 0
+                use __ = sub.ReceiveReady.Subscribe(fun _ ->
+                    if !i < 100 then
+                        let update = sub.ReceiveFrameString()
+                        let zipcode, temperature, relhumidity =
+                            let update' = update.Split()
+                            (int update'.[0]),(int update'.[1]),(int update'.[2])
+                        total_temp := !total_temp + temperature
+                        incr i
+                        log (sprintf "Average temperature for zipcode '%s' is %dF" filter (!total_temp / !i))
+                    else 
+                        poller.Stop()
+                    )
+                poller.Run()
+                sub.Unsubscribe(filter)
+                sub.Disconnect(uri)
+                poller.Remove(sub)
             with e -> log e.Message
     
 module UI =
@@ -177,72 +222,78 @@ module UI =
 
     let ui_scheduler = Avalonia.Threading.AvaloniaScheduler.Instance
 
-    module HelloWorld =
-        let server_stream = Subject.Synchronize(Subject.broadcast,ui_scheduler)
-        let client_stream = Subject.Synchronize(Subject.broadcast,ui_scheduler)
+    let text_list obs =
+        border [
+            do' <| fun x -> x.BorderBrush <- Brushes.Black; x.BorderThickness <- Thickness 0.5
+            child <| scroll_viewer [
+                //do' <| fun x -> x.MinHeight <- 500.0
+                vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(function 
+                    | Some (i,x) ->
+                        A 1.0, [
+                            text_block [do' <| fun c -> c.Text <- sprintf "%i:" i; c.HorizontalAlignment <- HorizontalAlignment.Right]
+                            text_block [do' <| fun c -> c.Text <- x]
+                            ]
+                    | None ->
+                        A 1.0, [text_block [do' <| fun c -> c.Text <- "-----"; Grid.SetColumnSpan(c,2)]]
+                    ))
+                |> content
+                prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) obs
+                ]
+            ]
+
+    type Msg = Add of id: int * msg: string
+    type MsgStart = StartExample
+    type State = Map<int,int>
+
+    let tab_template l =
+        let streams = Array.map (fun (name,_) -> name, Subject.Synchronize(Subject.broadcast,ui_scheduler)) l
         
-        type Msg = AddServer of string | AddClient of string
-        type MsgStart = StartExample
-        type State = {server_count : int; client_count : int}
         // The ThreadPoolScheduler assigns a different thread for each subscription and 
         // dispatches on them consistently for the lifetime of the subscription.
-        let msg_stream = Subject.Synchronize(Subject.broadcast,ThreadPoolScheduler.Instance)
-
-        open Messaging
-        open Messaging.HelloWorld
-            
         let start_stream = Subject.Synchronize(Subject.broadcast,ThreadPoolScheduler.Instance)
         let state =
-            let init = {server_count=0; client_count=0}
             start_stream 
-            |> Observable.map (fun StartExample ->
+            |> Observable.switchMap (fun StartExample -> 
                 Observable.using (fun () -> 
-                    run [|server (AddServer >> msg_stream.OnNext); client (AddClient >> msg_stream.OnNext)|]
-                    |> Disposable.compose (Disposable.Create(fun () -> server_stream.OnNext None; client_stream.OnNext None))
-                    ) <| fun _ ->
-                // Note: The follwoing mostly works fine, but can drop initial messages. It does not happen during
-                // the first subscription so it is only a small problem, but for a correct agent based implementation, check out
-                // the 05_ZeroMQ example.
-                msg_stream |> Observable.scanInit init (fun model msg ->
-                    let update (f : _ ISubject) i x = f.OnNext(Some(i, x)); i+1
-                    match msg with
-                    | AddServer x -> {model with server_count=update server_stream model.server_count x}
-                    | AddClient x -> {model with client_count=update client_stream model.client_count x}
-                    )
+                    // I changed to using an agent because on the weather example it is possible for messages to be sent before
+                    // the Observable.scan is ready. This error is present in the 04_Zero_HelloWorld example.
+                    let agent = FSharpx.Control.AutoCancelAgent.Start(fun mailbox -> async {
+                        let line_counts = Array.zeroCreate l.Length
+                        let rec loop () = async {
+                            let! (Add(i,x)) = mailbox.Receive()
+                            let count = line_counts.[i]
+                            (snd streams.[i]).OnNext(Some(count, x))
+                            line_counts.[i] <- count + 1
+                            do! loop()
+                            }
+                        do! loop ()
+                        })
+                    l |> Array.mapi (fun i (_,f) -> f (fun x -> agent.Post(Add(i,x))))
+                    |> Messaging.run
+                    |> Disposable.compose (Disposable.Create(fun () -> streams |> Array.iter (fun (_,x) -> x.OnNext None)))
+                    |> Disposable.compose agent
+                    ) (fun _ -> Observable.neverWitness ())
                 )
-            |> Observable.switch
-            |> Observable.publishInitial init
+            |> Observable.publish
             |> Observable.refCount
-            |> Observable.observeOn ui_scheduler
 
-        let view = 
-            let text_list obs =
-                border [
-                    do' <| fun x -> x.BorderBrush <- Brushes.Black; x.BorderThickness <- Thickness 0.5
-                    child <| scroll_viewer [
-                        content <| vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(function 
-                            | Some (i,x) ->
-                                A 1.0, [
-                                    text_block [do' <| fun c -> c.Text <- sprintf "%i:" i; c.HorizontalAlignment <- HorizontalAlignment.Right]
-                                    text_block [do' <| fun c -> c.Text <- x]
-                                    ]
-                            | None ->
-                                A 1.0, [text_block [do' <| fun c -> c.Text <- "-----"; Grid.SetColumnSpan(c,2)]]
-                            ))
-                        prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) obs
-                        ]
-                    ]
-            vert_grid [connect state] [
-                A 1.0, button [
-                    do' <| fun x -> x.Content <- "Run Server & Client"
-                    event (fun x -> x.Click) (fun _ _ -> start_stream.OnNext StartExample)
-                    ]
-                A 1.0, text_block [do' <| fun x -> x.Text <- "Server:"]
-                S 1.0, text_list server_stream
-                A 1.0, text_block [do' <| fun x -> x.Text <- "Client:"]
-                S 1.0, text_list client_stream
-                ]
+        let start_button = A 1.0, button [
+            do' <| fun x -> x.Content <- sprintf "Run %s" (streams |> Array.map fst |> String.concat " & ")
+            event (fun x -> x.Click) (fun _ _ -> start_stream.OnNext StartExample)
+            ]
+
+        let stream_displays =
+            streams |> Array.map (fun (name,stream) -> [
+                A 1.0, text_block [do' <| fun x -> x.Text <- sprintf "%s:" name]
+                P 230.0, text_list stream
+                ])
+            |> Array.toList |> List.concat
+        
+        scroll_viewer [
+            content <| vert_grid [connect state] (start_button :: stream_displays)
+            ]
     
+    open Messaging
     let view = 
         window [
             do' <| fun t ->
@@ -252,7 +303,20 @@ module UI =
                 t.Title <- "ZeroMQ Examples"
             content <| tab_control [
                 items [
-                    [do' (fun x -> x.Header <- "Hello World"); content HelloWorld.view]
+                    [do' (fun x -> x.Header <- "Hello World"); content (tab_template [|"Server", HelloWorld.server; "Client", HelloWorld.client|])]
+                    [
+                    do' (fun x -> x.Header <- "Weather") 
+                    [|
+                    "Server", Weather.server
+                    "Client 1", Weather.client "10001"
+                    "Client 2", Weather.client "10002"
+                    "Client 3", Weather.client "10003"
+                    "Client 4", Weather.client "10004"
+                    "Client 5", Weather.client "10005"
+                    "Client 6", Weather.client "10006"
+                    "Client 7", Weather.client "10007"
+                    |] |> tab_template |> content
+                    ]
                     ]
                 ]
             ]
