@@ -3,6 +3,166 @@
 open System
 open System.Threading
 
+module Messaging =
+    open System
+    open System.Threading
+    open System.Threading.Tasks
+    open NetMQ
+    open NetMQ.Sockets
+    open System.Reactive.Disposables
+
+    let run l =
+        let l = l |> Array.map (fun f -> let poller = new NetMQPoller() in poller, Task.Run(fun () -> f poller : unit))
+        Disposable.Create(fun () ->
+            let pollers, tasks = Array.unzip l
+            pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
+            Task.WaitAll(tasks)
+            (pollers, tasks) ||> Array.iter2 (fun a b -> a.Dispose(); b.Dispose())
+            )
+
+    let inline t a b x rest = a x; let r = rest() in b x; r
+    module NetMQPoller =
+        let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
+    module SubscriberSocket =
+        let inline subscribe (socket : SubscriberSocket) (prefix : string) rest = (prefix, rest) ||> t socket.Subscribe socket.Unsubscribe
+    module NetMQSocket =
+        let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
+        let inline connect uri (socket : NetMQSocket) rest = t socket.Connect socket.Disconnect uri rest
+        let inline init (socket_create : unit -> #NetMQSocket) (poller : NetMQPoller) (connector : #NetMQSocket -> (unit -> 'r) -> 'r) rest =
+            use socket = socket_create()
+            NetMQPoller.add poller socket <| fun () ->
+            connector socket <| fun () -> 
+            rest socket
+    
+    open NetMQSocket
+
+    module HelloWorld =
+        let uri = "ipc://hello-world"
+        let server (log : string -> unit) (poller: NetMQPoller) =
+            try init ResponseSocket poller (bind uri) <| fun server ->
+                log <| sprintf "Server has bound to: %s" uri
+                use __ = server.ReceiveReady.Subscribe(fun x ->
+                    let x = server.ReceiveFrameString()
+                    log (sprintf "Server received %s" x)
+                    Thread.Sleep(1000)
+                    let msg = sprintf "%s World" x
+                    log (sprintf "Server sending %s" msg)
+                    server.SendFrame(msg)
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let client (log : string -> unit) (poller: NetMQPoller)  =
+            try init RequestSocket poller (connect uri) <| fun client ->
+                log <| sprintf "Client has connected to: %s" uri
+                let i = ref 0
+                use __ = client.SendReady.Subscribe(fun _ -> 
+                    if !i < 3 then
+                        let msg = "Hello"
+                        msg |> sprintf "Client sending %s" |> log 
+                        client.SendFrame(msg)
+                        incr i
+                    else 
+                        poller.Stop()
+                    )
+                use __ = client.ReceiveReady.Subscribe(fun _ -> 
+                    client.ReceiveFrameString() |> sprintf "Client received %s" |> log
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+    module Weather =
+        let uri = "ipc://weather"
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            try let rand = Random()
+                init PublisherSocket poller (bind uri) <| fun pub ->
+                log <| sprintf "Publisher has bound to %s." uri
+                use __ = pub.SendReady.Subscribe(fun _ ->  
+                    // get values that will fool the boss
+                    let zipcode, temperature, relhumidity = rand.Next 100000, (rand.Next 215) - 80, (rand.Next 50) + 10
+                    sprintf "%05d %d %d" zipcode temperature relhumidity |> pub.SendFrame
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
+            try init SubscriberSocket poller (connect uri) <| fun sub ->
+                SubscriberSocket.subscribe sub filter <| fun _ ->
+                log <| sprintf "Client has connected to %s and subscribed to the topic %s." uri filter
+                let i = ref 0
+                let total_temp = ref 0
+                use __ = sub.ReceiveReady.Subscribe(fun _ ->
+                    if !i < 100 then
+                        let update = sub.ReceiveFrameString()
+                        let zipcode, temperature, relhumidity =
+                            let update' = update.Split()
+                            (int update'.[0]),(int update'.[1]),(int update'.[2])
+                        total_temp := !total_temp + temperature
+                        incr i
+                        log (sprintf "Average temperature for zipcode '%s' is %dF" filter (!total_temp / !i))
+                    else 
+                        poller.Stop()
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+    module DivideAndConquer =
+        let task_number = 100
+        let uri_sender, uri_sink = 
+            let uri = "ipc://divide_and_conquer"
+            IO.Path.Join(uri,"a"), IO.Path.Join(uri,"b")
+
+        let ventilator timeout (log : string -> unit) (poller : NetMQPoller) =
+            try let rnd = Random()
+                init PushSocket poller (bind uri_sender) <| fun sender ->
+                init PushSocket poller (connect uri_sink) <| fun sink ->
+                let tasks = Array.init task_number (fun _ -> rnd.Next 100+1)
+                log <| sprintf "Waiting %ims for the workers to get ready..." timeout
+                Thread.Sleep(timeout)
+                log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
+                sink.SendFrame("0")
+                log <| "Sending tasks to workers."
+                Array.iter (string >> sender.SendFrame) tasks
+            with e -> log e.Message
+
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            try init PullSocket poller (connect uri_sender) <| fun sender ->
+                init PushSocket poller (connect uri_sink) <| fun sink ->
+                use __ = sender.ReceiveReady.Subscribe(fun _ ->
+                    let msg = sender.ReceiveFrameString()
+                    log <| sprintf "Received message %s." msg
+                    Thread.Sleep(int msg)
+                    sink.SendFrame("")
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let sink (log : string -> unit) (poller : NetMQPoller) =
+            try init PullSocket poller (bind uri_sink) <| fun sink ->
+                let watch = Diagnostics.Stopwatch()
+                use __ = sink.ReceiveReady.Subscribe(fun _ ->
+                    let _ = sink.ReceiveFrameString()
+                    log <| sprintf "Received message. Time elapsed: %A." watch.Elapsed
+                    if watch.IsRunning = false then watch.Start()
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+    module RequestReply =
+        let request_number = 10
+        let uri_server, uri_client =
+            let uri = "ipc://request_reply"
+            IO.Path.Join(uri,"server"), IO.Path.Join(uri,"client")
+
+        let client (log : string -> unit) (poller : NetMQPoller) =
+            try init RequestSocket poller (connect uri_client) <| fun requester ->
+                for i=1 to request_number do
+                    requester.SendFrame("Hello")
+                    let message = requester.ReceiveFrameString()
+                    log <| sprintf "Received reply %i (%s)" i message
+            with e -> log e.Message
+
+
 module Lithe = 
     open Avalonia
     open Avalonia.Controls
@@ -103,112 +263,6 @@ module Lithe =
     let vert_grid (l' : (Grid -> IDisposable) list) (l : (GridUnit * Control IObservable) list) =
         vert_grid' l' (l |> List.map (fun (s,row) -> s, [row]) |> Observable.ofSeq)
 
-module Messaging =
-    open System
-    open System.Threading
-    open System.Threading.Tasks
-    open NetMQ
-    open NetMQ.Sockets
-    open System.Reactive.Disposables
-
-    let run l =
-        let l = l |> Array.map (fun f -> let poller = new NetMQPoller() in poller, Task.Run(fun () -> f poller : unit))
-        Disposable.Create(fun () ->
-            let pollers, tasks = Array.unzip l
-            pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
-            Task.WaitAll(tasks)
-            (pollers, tasks) ||> Array.iter2 (fun a b -> a.Dispose(); b.Dispose())
-            )
-
-    module HelloWorld =
-        let uri = "ipc://hello-world"
-        let server (log : string -> unit) (poller: NetMQPoller) =
-            try use server = new ResponseSocket()
-                poller.Add(server)
-                log <| sprintf "Server is binding to: %s" uri
-                server.Bind(uri)
-                log <| "Done binding."
-                use __ = server.ReceiveReady.Subscribe(fun x ->
-                    let x = server.ReceiveFrameString()
-                    log (sprintf "Server received %s" x)
-                    Thread.Sleep(1000)
-                    let msg = sprintf "%s World" x
-                    log (sprintf "Server sending %s" msg)
-                    server.SendFrame(msg)
-                    )
-                poller.Run()
-                server.Unbind(uri)
-                poller.Remove(server)
-            with e -> log e.Message
-
-        let client (log : string -> unit) (poller: NetMQPoller)  =
-            try use client = new RequestSocket()
-                poller.Add(client)
-                log <| sprintf "Client is connecting to: %s" uri
-                client.Connect(uri)
-                log <| "Done connecting."
-                let i = ref 0
-                use __ = client.SendReady.Subscribe(fun _ -> 
-                    if !i < 3 then
-                        let msg = "Hello"
-                        msg |> sprintf "Client sending %s" |> log 
-                        client.SendFrame(msg)
-                        incr i
-                    else 
-                        poller.Stop()
-                    )
-                use __ = client.ReceiveReady.Subscribe(fun _ -> 
-                    client.ReceiveFrameString() |> sprintf "Client received %s" |> log
-                    )
-                poller.Run()
-                client.Disconnect(uri)
-                poller.Remove(client)
-            with e -> log e.Message
-
-    module Weather =
-        let uri = "ipc://weather"
-        let server (log : string -> unit) (poller : NetMQPoller) =
-            try let rand = Random()
-                use pub = new PublisherSocket()
-                poller.Add(pub)
-                pub.Bind(uri)
-                log "Publisher has bound."
-                use __ = pub.SendReady.Subscribe(fun _ ->  
-                    // get values that will fool the boss
-                    let zipcode, temperature, relhumidity = rand.Next 100000, (rand.Next 215) - 80, (rand.Next 50) + 10
-                    sprintf "%05d %d %d" zipcode temperature relhumidity |> pub.SendFrame
-                    )
-                poller.Run()
-                pub.Unbind(uri)
-                poller.Remove(pub)
-            with e -> log e.Message
-
-        let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
-            try use sub = new SubscriberSocket()
-                poller.Add(sub)
-                sub.Connect(uri)
-                sub.Subscribe(filter)
-                log "Client has connected and subscribed."
-                let i = ref 0
-                let total_temp = ref 0
-                use __ = sub.ReceiveReady.Subscribe(fun _ ->
-                    if !i < 100 then
-                        let update = sub.ReceiveFrameString()
-                        let zipcode, temperature, relhumidity =
-                            let update' = update.Split()
-                            (int update'.[0]),(int update'.[1]),(int update'.[2])
-                        total_temp := !total_temp + temperature
-                        incr i
-                        log (sprintf "Average temperature for zipcode '%s' is %dF" filter (!total_temp / !i))
-                    else 
-                        poller.Stop()
-                    )
-                poller.Run()
-                sub.Unsubscribe(filter)
-                sub.Disconnect(uri)
-                poller.Remove(sub)
-            with e -> log e.Message
-    
 module UI =
     open Lithe
     open Avalonia.Media
@@ -274,11 +328,11 @@ module UI =
                     |> Disposable.compose agent
                     ) (fun _ -> Observable.neverWitness ())
                 )
-            |> Observable.publish
-            |> Observable.refCount
 
-        let start_button = A 1.0, button [
-            do' <| fun x -> x.Content <- sprintf "Run %s" (streams |> Array.map fst |> String.concat " & ")
+        let start_button = button [
+            do' <| fun x -> 
+                x.Content <- sprintf "Run %s" (streams |> Array.map fst |> String.concat " & ")
+                DockPanel.SetDock(x,Dock.Top)
             event (fun x -> x.Click) (fun _ _ -> start_stream.OnNext StartExample)
             ]
 
@@ -289,8 +343,14 @@ module UI =
                 ])
             |> Array.toList |> List.concat
         
-        scroll_viewer [
-            content <| vert_grid [connect state] (start_button :: stream_displays)
+        dock_panel [
+            connect state
+            children <| [
+                start_button
+                scroll_viewer [
+                    content <| vert_grid [] stream_displays
+                    ]
+                ]
             ]
     
     open Messaging
@@ -303,9 +363,15 @@ module UI =
                 t.Title <- "ZeroMQ Examples"
             content <| tab_control [
                 items [
-                    [do' (fun x -> x.Header <- "Hello World"); content (tab_template [|"Server", HelloWorld.server; "Client", HelloWorld.client|])]
                     [
-                    do' (fun x -> x.Header <- "Weather") 
+                    do' (fun x -> x.Header <- "Hello World")
+                    [|
+                    "Server", HelloWorld.server
+                    "Client", HelloWorld.client
+                    |] |> tab_template |> content
+                    ]
+                    [
+                    do' <| fun x -> x.Header <- "Weather"
                     [|
                     "Server", Weather.server
                     "Client 1", Weather.client "10001"
@@ -315,6 +381,17 @@ module UI =
                     "Client 5", Weather.client "10005"
                     "Client 6", Weather.client "10006"
                     "Client 7", Weather.client "10007"
+                    |] |> tab_template |> content
+                    ]
+                    [
+                    do' <| fun x -> x.Header <- "Divide & Conquer"
+                    [|
+                    "Ventilator", DivideAndConquer.ventilator 1000
+                    "Worker 1", DivideAndConquer.worker
+                    "Worker 2", DivideAndConquer.worker
+                    "Worker 3", DivideAndConquer.worker
+                    "Worker 4", DivideAndConquer.worker
+                    "Sink", DivideAndConquer.sink
                     |] |> tab_template |> content
                     ]
                     ]
