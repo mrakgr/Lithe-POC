@@ -180,8 +180,10 @@ module Messaging =
                 log <| sprintf "Broker frontend has bound to %s" uri_client
                 init DealerSocket poller (bind uri_worker) <| fun backend ->
                 log <| sprintf "Broker backend has bound to %s" uri_worker
-                use __ = frontend.ReceiveReady.Subscribe(fun _ -> frontend.ReceiveFrameString() |> backend.SendFrame)
-                use __ = backend.ReceiveReady.Subscribe(fun _ -> backend.ReceiveFrameString() |> frontend.SendFrame)
+                Proxy(frontend,backend,null,poller).Start()
+                // These two can be used instead of the proxy.
+                //use __ = frontend.ReceiveReady.Subscribe(fun _ -> frontend.ReceiveMultipartMessage() |> backend.SendMultipartMessage)
+                //use __ = backend.ReceiveReady.Subscribe(fun _ -> backend.ReceiveMultipartMessage() |> frontend.SendMultipartMessage)
                 poller.Run()
             with e -> log e.Message
 
