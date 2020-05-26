@@ -85,7 +85,7 @@ module Messaging =
                 poller.Run()
             with e -> log e.Message
 
-        let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
+        let client' uri (filter : string) (log : string -> unit) (poller : NetMQPoller) =
             try init SubscriberSocket poller (connect uri) <| fun sub ->
                 SubscriberSocket.subscribe sub filter <| fun _ ->
                 log <| sprintf "Client has connected to %s and subscribed to the topic %s." uri filter
@@ -105,6 +105,8 @@ module Messaging =
                     )
                 poller.Run()
             with e -> log e.Message
+
+        let client = client' uri
 
     module DivideAndConquer =
         let task_number = 100
@@ -150,9 +152,8 @@ module Messaging =
 
     module RequestAndReply =
         let request_number = 10
-        let uri_worker, uri_client =
-            let uri = "ipc://request_reply"
-            IO.Path.Join(uri,"worker"), IO.Path.Join(uri,"client")
+        let uri = "ipc://request_reply"
+        let uri_worker, uri_client = IO.Path.Join(uri,"worker"), IO.Path.Join(uri,"client")
 
         let client (log : string -> unit) (poller : NetMQPoller) =
             try init RequestSocket poller (connect uri_client) <| fun requester ->
@@ -186,6 +187,19 @@ module Messaging =
                 //use __ = backend.ReceiveReady.Subscribe(fun _ -> backend.ReceiveMultipartMessage() |> frontend.SendMultipartMessage)
                 poller.Run()
             with e -> log e.Message
+
+    module WeatherProxy =
+        let uri_sub = "ipc://weather_internal"
+        let broker (log : string -> unit) (poller : NetMQPoller) =
+            try init XSubscriberSocket poller (connect Weather.uri) <| fun frontend ->
+                log <| sprintf "Weather proxy frontend has connected to %s" Weather.uri
+                init XPublisherSocket poller (bind uri_sub) <| fun backend ->
+                log <| sprintf "Weather proxy backend has bound to %s" uri_sub
+                Proxy(frontend,backend,null,poller).Start()
+                poller.Run()
+            with e -> log e.Message
+
+        let client = Weather.client' uri_sub
 
 module Lithe = 
     open Avalonia
@@ -418,6 +432,13 @@ module UI =
                         "Client", RequestAndReply.client
                         "Worker", RequestAndReply.worker
                         "Broker", RequestAndReply.broker
+                        |]
+                    tab "Weather Proxy" [|
+                        "Server", Weather.server
+                        "Broker", WeatherProxy.broker
+                        "Client 1", WeatherProxy.client "10007"
+                        "Client 2", WeatherProxy.client "10008"
+                        "Client 3", WeatherProxy.client "10009"
                         |]
                     ]
                 ]
