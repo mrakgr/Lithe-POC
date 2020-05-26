@@ -148,20 +148,42 @@ module Messaging =
                 poller.Run()
             with e -> log e.Message
 
-    module RequestReply =
+    module RequestAndReply =
         let request_number = 10
-        let uri_server, uri_client =
+        let uri_worker, uri_client =
             let uri = "ipc://request_reply"
-            IO.Path.Join(uri,"server"), IO.Path.Join(uri,"client")
+            IO.Path.Join(uri,"worker"), IO.Path.Join(uri,"client")
 
         let client (log : string -> unit) (poller : NetMQPoller) =
             try init RequestSocket poller (connect uri_client) <| fun requester ->
+                log <| sprintf "Client has connected to %s" uri_client
                 for i=1 to request_number do
                     requester.SendFrame("Hello")
                     let message = requester.ReceiveFrameString()
-                    log <| sprintf "Received reply %i (%s)" i message
+                    log <| sprintf "Received reply %i: %s" i message
             with e -> log e.Message
 
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            try init ResponseSocket poller (connect uri_worker) <| fun responder ->
+                log <| sprintf "Worker has connected to %s" uri_worker
+                use __ = responder.ReceiveReady.Subscribe(fun _ ->
+                    let message = responder.ReceiveFrameString()
+                    log <| sprintf "Received request: %s" message
+                    Thread.Sleep(1)
+                    responder.SendFrame("World")
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let broker (log : string -> unit) (poller : NetMQPoller) =
+            try init RouterSocket poller (bind uri_client) <| fun frontend ->
+                log <| sprintf "Broker frontend has bound to %s" uri_client
+                init DealerSocket poller (bind uri_worker) <| fun backend ->
+                log <| sprintf "Broker backend has bound to %s" uri_worker
+                use __ = frontend.ReceiveReady.Subscribe(fun _ -> frontend.ReceiveFrameString() |> backend.SendFrame)
+                use __ = backend.ReceiveReady.Subscribe(fun _ -> backend.ReceiveFrameString() |> frontend.SendFrame)
+                poller.Run()
+            with e -> log e.Message
 
 module Lithe = 
     open Avalonia
@@ -363,37 +385,38 @@ module UI =
                 t.Title <- "ZeroMQ Examples"
             content <| tab_control [
                 items [
-                    [
-                    do' (fun x -> x.Header <- "Hello World")
-                    [|
-                    "Server", HelloWorld.server
-                    "Client", HelloWorld.client
-                    |] |> tab_template |> content
-                    ]
-                    [
-                    do' <| fun x -> x.Header <- "Weather"
-                    [|
-                    "Server", Weather.server
-                    "Client 1", Weather.client "10001"
-                    "Client 2", Weather.client "10002"
-                    "Client 3", Weather.client "10003"
-                    "Client 4", Weather.client "10004"
-                    "Client 5", Weather.client "10005"
-                    "Client 6", Weather.client "10006"
-                    "Client 7", Weather.client "10007"
-                    |] |> tab_template |> content
-                    ]
-                    [
-                    do' <| fun x -> x.Header <- "Divide & Conquer"
-                    [|
-                    "Ventilator", DivideAndConquer.ventilator 1000
-                    "Worker 1", DivideAndConquer.worker
-                    "Worker 2", DivideAndConquer.worker
-                    "Worker 3", DivideAndConquer.worker
-                    "Worker 4", DivideAndConquer.worker
-                    "Sink", DivideAndConquer.sink
-                    |] |> tab_template |> content
-                    ]
+                    let tab header l = 
+                        [
+                        do' (fun (x : TabItem) -> x.Header <- header)
+                        l |> tab_template |> content
+                        ]
+                    tab "Hello World" [|
+                        "Server", HelloWorld.server
+                        "Client", HelloWorld.client
+                        |]
+                    tab "Weather" [|
+                        "Server", Weather.server
+                        "Client 1", Weather.client "10001"
+                        "Client 2", Weather.client "10002"
+                        "Client 3", Weather.client "10003"
+                        "Client 4", Weather.client "10004"
+                        "Client 5", Weather.client "10005"
+                        "Client 6", Weather.client "10006"
+                        "Client 7", Weather.client "10007"
+                        |]
+                    tab "Divide & Conquer" [|
+                        "Ventilator", DivideAndConquer.ventilator 1000
+                        "Worker 1", DivideAndConquer.worker
+                        "Worker 2", DivideAndConquer.worker
+                        "Worker 3", DivideAndConquer.worker
+                        "Worker 4", DivideAndConquer.worker
+                        "Sink", DivideAndConquer.sink
+                        |]
+                    tab "Request & Reply" [|
+                        "Client", RequestAndReply.client
+                        "Worker", RequestAndReply.worker
+                        "Broker", RequestAndReply.broker
+                        |]
                     ]
                 ]
             ]
