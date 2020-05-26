@@ -112,7 +112,7 @@ module Messaging =
         let task_number = 100
         let uri_sender, uri_sink = 
             let uri = "ipc://divide_and_conquer"
-            IO.Path.Join(uri,"a"), IO.Path.Join(uri,"b")
+            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink")
 
         let ventilator timeout (log : string -> unit) (poller : NetMQPoller) =
             try let rnd = Random()
@@ -122,9 +122,10 @@ module Messaging =
                 log <| sprintf "Waiting %ims for the workers to get ready..." timeout
                 Thread.Sleep(timeout)
                 log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
-                sink.SendFrame("0")
+                sink.SendFrame(string task_number)
                 log <| "Sending tasks to workers."
                 Array.iter (string >> sender.SendFrame) tasks
+                log "Done sending tasks."
             with e -> log e.Message
 
         let worker (log : string -> unit) (poller : NetMQPoller) =
@@ -200,6 +201,69 @@ module Messaging =
             with e -> log e.Message
 
         let client = Weather.client' uri_sub
+
+    module KillSignal =
+        let task_number = 100
+        let uri_sender, uri_sink, uri_kill, uri_sink_start = 
+            let uri = "ipc://kill_signaling"
+            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink"), IO.Path.Join(uri,"kill"), IO.Path.Join(uri,"sink_start")
+
+        let ventilator timeout (log : string -> unit) (poller : NetMQPoller) =
+            try let rnd = Random()
+                init PushSocket poller (bind uri_sender) <| fun sender ->
+                init RequestSocket poller (connect uri_sink_start) <| fun sink ->
+                let tasks = Array.init task_number (fun _ -> rnd.Next 100+1)
+                //log <| sprintf "Waiting %ims for the workers to get ready..." timeout
+                //Thread.Sleep(timeout)
+                log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
+                log "Starting the sink."
+                sink.SendFrame(string task_number)
+                sink.ReceiveMultipartMessage() |> ignore
+                log "Sending tasks to workers."
+                Array.iter (string >> sender.SendFrame) tasks
+                log "Done sending tasks."
+            with e -> log e.Message
+
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            try init PullSocket poller (connect uri_sender) <| fun sender ->
+                init PushSocket poller (connect uri_sink) <| fun sink ->
+                init SubscriberSocket poller (connect uri_kill) <| fun controller ->
+                SubscriberSocket.subscribe controller "" <| fun _ ->
+                use __ = controller.ReceiveReady.Subscribe(fun _ ->
+                    let _ = controller.ReceiveMultipartMessage()
+                    log "Received kill signal. Stopping."
+                    poller.Stop()
+                    )
+                use __ = sender.ReceiveReady.Subscribe(fun _ ->
+                    let msg = sender.ReceiveFrameString()
+                    log <| sprintf "Received message %s." msg
+                    Thread.Sleep(int msg)
+                    sink.SendFrame("")
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let sink (log : string -> unit) (poller : NetMQPoller) =
+            try init PullSocket poller (bind uri_sink) <| fun sink ->
+                init ResponseSocket poller (bind uri_sink_start) <| fun sink_start ->
+                let near_to = sink_start.ReceiveFrameString() |> int
+                sink_start.SendFrameEmpty()
+                if near_to <= 0 then log "No tasks to process."
+                else 
+                    log <| sprintf "The number of tasks to process is %i" near_to
+                    init PublisherSocket poller (bind uri_kill) <| fun controller ->
+                    
+                    let watch = Diagnostics.Stopwatch.StartNew()
+                    let from = ref 0
+                    let rest _ =
+                        let _ = sink.ReceiveFrameString()
+                        log <| sprintf "Received message. Time elapsed: %A." watch.Elapsed
+                        incr from
+                        if !from = near_to then controller.SendFrameEmpty(); log "Done with the tasks."; poller.Stop()
+                    
+                    use __ = sink.ReceiveReady.Subscribe(fun x -> rest x)
+                    poller.Run()
+            with e -> log e.Message
 
 module Lithe = 
     open Avalonia
@@ -318,7 +382,6 @@ module UI =
         border [
             do' <| fun x -> x.BorderBrush <- Brushes.Black; x.BorderThickness <- Thickness 0.5
             child <| scroll_viewer [
-                //do' <| fun x -> x.MinHeight <- 500.0
                 vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(function 
                     | Some (i,x) ->
                         A 1.0, [
@@ -342,7 +405,7 @@ module UI =
         
         // The ThreadPoolScheduler assigns a different thread for each subscription and 
         // dispatches on them consistently for the lifetime of the subscription.
-        let start_stream = Subject.Synchronize(Subject.broadcast,ThreadPoolScheduler.Instance)
+        let start_stream = Subject.Synchronize(Subject.broadcast,ui_scheduler) // TODO: Revert to the ThreadPool scheduler after resolving the Divide & Conquer message dropping bug.
         let state =
             start_stream 
             |> Observable.switchMap (fun StartExample -> 
@@ -377,7 +440,7 @@ module UI =
         let stream_displays =
             streams |> Array.map (fun (name,stream) -> [
                 A 1.0, text_block [do' <| fun x -> x.Text <- sprintf "%s:" name]
-                P 230.0, text_list stream
+                P 150.0, text_list stream
                 ])
             |> Array.toList |> List.concat
         
@@ -439,6 +502,14 @@ module UI =
                         "Client 1", WeatherProxy.client "10007"
                         "Client 2", WeatherProxy.client "10008"
                         "Client 3", WeatherProxy.client "10009"
+                        |]
+                    tab "Kill Signaling" [|
+                        "Ventilator", KillSignal.ventilator 1000
+                        "Worker 1", KillSignal.worker
+                        "Worker 2", KillSignal.worker
+                        "Worker 3", KillSignal.worker
+                        "Worker 4", KillSignal.worker
+                        "Sink", KillSignal.sink
                         |]
                     ]
                 ]
