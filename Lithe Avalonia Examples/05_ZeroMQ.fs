@@ -12,12 +12,14 @@ module Messaging =
     open System.Reactive.Disposables
 
     let run l =
-        let l = l |> Array.map (fun f -> let poller = new NetMQPoller() in poller, Task.Run(fun () -> f poller : unit))
+        let l = l |> Array.map (fun f -> 
+            let poller = new NetMQPoller()
+            let thread = Thread(ThreadStart(fun () -> f poller), 1024*16, IsBackground=true)
+            thread.Start()
+            poller, thread)
         Disposable.Create(fun () ->
-            let pollers, tasks = Array.unzip l
-            pollers |> Array.iter (fun (x : NetMQPoller) -> x.Stop())
-            Task.WaitAll(tasks)
-            (pollers, tasks) ||> Array.iter2 (fun a b -> a.Dispose(); b.Dispose())
+            l |> Array.iter (fun (poller,thread) -> poller.Stop())
+            l |> Array.iter (fun (poller,thread) -> thread.Join(); poller.Dispose())
             )
 
     let inline t a b x rest = try a x; rest() finally try b x with e -> ()
@@ -37,6 +39,8 @@ module Messaging =
     open NetMQSocket
 
     module HelloWorld =
+        let msg_num = 3
+        let timeout = 1000
         let uri = "ipc://hello-world"
         let server (log : string -> unit) (poller: NetMQPoller) =
             try init ResponseSocket poller (bind uri) <| fun server ->
@@ -44,7 +48,7 @@ module Messaging =
                 use __ = server.ReceiveReady.Subscribe(fun x ->
                     let x = server.ReceiveFrameString()
                     log (sprintf "Server received %s" x)
-                    Thread.Sleep(1000)
+                    Thread.Sleep(timeout)
                     let msg = sprintf "%s World" x
                     log (sprintf "Server sending %s" msg)
                     server.SendFrame(msg)
@@ -52,12 +56,12 @@ module Messaging =
                 poller.Run()
             with e -> log e.Message
 
-        let client (log : string -> unit) (poller: NetMQPoller)  =
+        let client' uri (log : string -> unit) (poller: NetMQPoller)  =
             try init RequestSocket poller (connect uri) <| fun client ->
                 log <| sprintf "Client has connected to: %s" uri
                 let i = ref 0
                 use __ = client.SendReady.Subscribe(fun _ -> 
-                    if !i < 3 then
+                    if !i < msg_num then
                         let msg = "Hello"
                         msg |> sprintf "Client sending %s" |> log 
                         client.SendFrame(msg)
@@ -70,6 +74,8 @@ module Messaging =
                     )
                 poller.Run()
             with e -> log e.Message
+
+        let client = client' uri
 
     module Weather =
         let uri = "ipc://weather"
@@ -265,6 +271,57 @@ module Messaging =
                     poller.Run()
             with e -> log e.Message
 
+    module MultithreadedService =
+        let uri_clients = "ipc://multithreaded_service"
+        let uri_workers = "inproc://workers"
+        let thread_nbr = 4
+
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            init ResponseSocket poller (connect uri_workers) <| fun workers ->
+            use __ = workers.ReceiveReady.Subscribe(fun _ ->
+                workers.ReceiveFrameString() |> sprintf "Received request: %s" |> log 
+                Thread.Sleep(1)
+                workers.SendFrame("World")
+                )
+            log "Ready."
+            poller.Run()
+
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            try init RouterSocket poller (bind uri_clients) <| fun clients ->
+                log <| sprintf "Router has bound to %s" uri_clients
+                init DealerSocket poller (bind uri_workers) <| fun workers ->
+                log <| sprintf "Dealer has bound to %s" uri_workers
+                use __ = Array.init thread_nbr (fun i -> worker (sprintf "Worker %i: %s" i >> log)) |> run
+                Proxy(clients,workers,null,poller).Start()
+                log "Proxy has started."
+                poller.Run()
+            with e -> log e.Message
+
+        let client = HelloWorld.client' uri_clients
+
+    module RelayRace =
+        let uri = "inproc://relay_race"
+        let uri_step1 = IO.Path.Join(uri,"step1")
+        let uri_step2 = IO.Path.Join(uri,"step2")
+        let uri_step3 = IO.Path.Join(uri,"step3")
+
+        let step1 () =
+            use xmitter = new PairSocket()
+            xmitter.Connect(uri_step2)
+            xmitter.SignalOK()
+            xmitter.Disconnect(uri_step2)
+
+        let step2 () =
+            use receiver = new PairSocket()
+            receiver.Bind(uri_step2)
+            let t = Thread(ThreadStart step1)
+            t.Start()
+            receiver.ReceiveSignal() |> ignore
+            use xmitter = new PairSocket()
+            xmitter.Connect(uri_step3)
+            xmitter.SignalOK()
+            xmitter.Disconnect(uri_step3)
+
 module Lithe = 
     open Avalonia
     open Avalonia.Controls
@@ -382,7 +439,7 @@ module UI =
         border [
             do' <| fun x -> x.BorderBrush <- Brushes.Black; x.BorderThickness <- Thickness 0.5
             child <| scroll_viewer [
-                vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(function 
+                content <| vert_grid' [cd_set [A 1.0; A 1.0]] (obs |> Observable.map(function 
                     | Some (i,x) ->
                         A 1.0, [
                             text_block [do' <| fun c -> c.Text <- sprintf "%i:" i; c.HorizontalAlignment <- HorizontalAlignment.Right]
@@ -391,7 +448,6 @@ module UI =
                     | None ->
                         A 1.0, [text_block [do' <| fun c -> c.Text <- "-----"; Grid.SetColumnSpan(c,2)]]
                     ))
-                |> content
                 prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) obs
                 ]
             ]
@@ -405,7 +461,7 @@ module UI =
         
         // The ThreadPoolScheduler assigns a different thread for each subscription and 
         // dispatches on them consistently for the lifetime of the subscription.
-        let start_stream = Subject.Synchronize(Subject.broadcast,ui_scheduler) // TODO: Revert to the ThreadPool scheduler after resolving the Divide & Conquer message dropping bug.
+        let start_stream = Subject.Synchronize(Subject.broadcast,ThreadPoolScheduler.Instance)
         let state =
             start_stream 
             |> Observable.switchMap (fun StartExample -> 
@@ -510,6 +566,13 @@ module UI =
                         "Worker 3", KillSignal.worker
                         "Worker 4", KillSignal.worker
                         "Sink", KillSignal.sink
+                        |]
+                    tab "Multithreaded Service" [|
+                        "Server", MultithreadedService.server
+                        "Client 1", MultithreadedService.client
+                        "Client 2", MultithreadedService.client
+                        "Client 3", MultithreadedService.client
+                        "Client 4", MultithreadedService.client
                         |]
                     ]
                 ]
