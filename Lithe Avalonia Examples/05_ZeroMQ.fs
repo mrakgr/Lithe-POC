@@ -22,7 +22,7 @@ module Messaging =
             l |> Array.iter (fun (poller,thread) -> thread.Join(); poller.Dispose())
             )
 
-    let inline t a b x rest = try a x; rest() finally try b x with e -> ()
+    let inline t a b x rest = try a x; rest() finally try b x with e -> printfn "%s" e.Message
     module NetMQPoller =
         let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
     module SubscriberSocket =
@@ -37,6 +37,16 @@ module Messaging =
             rest socket
     
     open NetMQSocket
+    module PairSocket =
+        let receive_string uri =
+            use receiver = new PairSocket()
+            bind uri receiver <| fun () ->
+            receiver.ReceiveFrameString()
+
+        let send_string uri (x : string) = 
+            use receiver = new PairSocket()
+            connect uri receiver <| fun () ->
+            receiver.SendFrame(x)
 
     module HelloWorld =
         let msg_num = 3
@@ -212,19 +222,17 @@ module Messaging =
         let task_number = 100
         let uri_sender, uri_sink, uri_kill, uri_sink_start = 
             let uri = "ipc://kill_signaling"
-            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink"), IO.Path.Join(uri,"kill"), IO.Path.Join(uri,"sink_start")
+            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink"), IO.Path.Join(uri,"kill"), IO.Path.Join(uri,"sink","start")
 
         let ventilator timeout (log : string -> unit) (poller : NetMQPoller) =
             try let rnd = Random()
                 init PushSocket poller (bind uri_sender) <| fun sender ->
-                init RequestSocket poller (connect uri_sink_start) <| fun sink ->
                 let tasks = Array.init task_number (fun _ -> rnd.Next 100+1)
-                log <| sprintf "Waiting %ims for the workers to get ready..." timeout
-                Thread.Sleep(timeout)
+                //log <| sprintf "Waiting %ims for the workers to get ready..." timeout
+                //Thread.Sleep(timeout)
                 log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
                 log "Starting the sink."
-                sink.SendFrame(string task_number)
-                sink.ReceiveMultipartMessage() |> ignore
+                PairSocket.send_string uri_sink_start (string task_number)
                 log "Sending tasks to workers."
                 Array.iter (string >> sender.SendFrame) tasks
                 log "Done sending tasks."
@@ -250,12 +258,10 @@ module Messaging =
             with e -> log e.Message
 
         let sink (log : string -> unit) (poller : NetMQPoller) =
-            try init PullSocket poller (bind uri_sink) <| fun sink ->
-                init ResponseSocket poller (bind uri_sink_start) <| fun sink_start ->
-                let near_to = sink_start.ReceiveFrameString() |> int
-                sink_start.SendFrameEmpty()
+            try let near_to = PairSocket.receive_string uri_sink_start |> int
                 if near_to <= 0 then log "No tasks to process."
                 else 
+                    init PullSocket poller (bind uri_sink) <| fun sink ->
                     log <| sprintf "The number of tasks to process is %i" near_to
                     init PublisherSocket poller (bind uri_kill) <| fun controller ->
                     
