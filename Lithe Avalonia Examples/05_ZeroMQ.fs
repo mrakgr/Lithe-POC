@@ -25,8 +25,7 @@ module Messaging =
     let inline t a b x rest = try a x; rest() finally try b x with e -> printfn "%s" e.Message
     module NetMQPoller =
         let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
-    module SubscriberSocket =
-        let inline subscribe (socket : SubscriberSocket) (prefix : string) rest = (prefix, rest) ||> t socket.Subscribe socket.Unsubscribe
+
     module NetMQSocket =
         let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
         let inline connect uri (socket : NetMQSocket) rest = t socket.Connect socket.Disconnect uri rest
@@ -35,12 +34,32 @@ module Messaging =
             NetMQPoller.add poller socket <| fun () ->
             connector socket <| fun () -> 
             rest socket
-    
+
     open NetMQSocket
+
+    module SubscriberSocket =
+        let inline subscribe (socket : SubscriberSocket) (prefix : string) rest = (prefix, rest) ||> t socket.Subscribe socket.Unsubscribe
+
+    module ResponseSocket =
+        let inline sync_receive_string uri =
+            use s = new ResponseSocket()
+            bind uri s <| fun () ->
+            let r = s.ReceiveFrameString()
+            s.SendFrameEmpty()
+            r
+
+    module RequestSocket =
+        let inline sync_send_string uri x =
+            use s = new RequestSocket()
+            connect uri s <| fun () ->
+            s.SendFrame(x : string)
+            s.ReceiveFrameBytes() |> ignore
+    
     module PairSocket =
-        let receive_string uri =
+        let receive_string uri rest =
             use receiver = new PairSocket()
             bind uri receiver <| fun () ->
+            rest()
             receiver.ReceiveFrameString()
 
         let send_string uri (x : string) = 
@@ -115,7 +134,7 @@ module Messaging =
                             (int update'.[0]),(int update'.[1]),(int update'.[2])
                         total_temp := !total_temp + temperature
                         incr i
-                        log (sprintf "Average temperature for zipcode '%s' is %dF" filter (!total_temp / !i))
+                        log (sprintf "Average temperature for zipcode '%s' since the start of the sequence is %dF" filter (!total_temp / !i))
                     else 
                         poller.Stop()
                     )
@@ -222,17 +241,18 @@ module Messaging =
         let task_number = 100
         let uri_sender, uri_sink, uri_kill, uri_sink_start = 
             let uri = "ipc://kill_signaling"
-            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink"), IO.Path.Join(uri,"kill"), IO.Path.Join(uri,"sink","start")
+            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink"), IO.Path.Join(uri,"kill"), IO.Path.Join(uri,"sink_start")
 
         let ventilator timeout (log : string -> unit) (poller : NetMQPoller) =
             try let rnd = Random()
                 init PushSocket poller (bind uri_sender) <| fun sender ->
+                RequestSocket.sync_send_string uri_sink_start (string task_number)
+                log "Ventilator has synced with the sink"
                 let tasks = Array.init task_number (fun _ -> rnd.Next 100+1)
-                //log <| sprintf "Waiting %ims for the workers to get ready..." timeout
-                //Thread.Sleep(timeout)
+                log <| sprintf "Waiting %ims for the workers to get ready..." timeout
+                Thread.Sleep(timeout)
                 log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
                 log "Starting the sink."
-                PairSocket.send_string uri_sink_start (string task_number)
                 log "Sending tasks to workers."
                 Array.iter (string >> sender.SendFrame) tasks
                 log "Done sending tasks."
@@ -258,12 +278,12 @@ module Messaging =
             with e -> log e.Message
 
         let sink (log : string -> unit) (poller : NetMQPoller) =
-            try let near_to = PairSocket.receive_string uri_sink_start |> int
+            try init PublisherSocket poller (bind uri_kill) <| fun controller ->
+                init PullSocket poller (bind uri_sink) <| fun sink ->
+                let near_to = ResponseSocket.sync_receive_string uri_sink_start |> int
                 if near_to <= 0 then log "No tasks to process."
                 else 
-                    init PullSocket poller (bind uri_sink) <| fun sink ->
                     log <| sprintf "The number of tasks to process is %i" near_to
-                    init PublisherSocket poller (bind uri_kill) <| fun controller ->
                     
                     let watch = Diagnostics.Stopwatch.StartNew()
                     let from = ref 0
@@ -307,26 +327,118 @@ module Messaging =
 
     module RelayRace =
         let uri = "inproc://relay_race"
-        let uri_step1 = IO.Path.Join(uri,"step1")
-        let uri_step2 = IO.Path.Join(uri,"step2")
-        let uri_step3 = IO.Path.Join(uri,"step3")
+        let num_steps = 4
 
-        let step1 () =
-            use xmitter = new PairSocket()
-            xmitter.Connect(uri_step2)
-            xmitter.SignalOK()
-            xmitter.Disconnect(uri_step2)
+        let start (log : string -> unit) (poller : NetMQPoller) =
+            let rec loop uri_parent l = 
+                match l with
+                | [] -> PairSocket.send_string uri_parent "READY"
+                | uri_child :: xs ->
+                    PairSocket.receive_string uri_child (fun () -> Thread(ThreadStart(fun () -> loop uri_child xs)).Start())
+                    |> PairSocket.send_string uri_parent
+                
+            let uri_step = List.init num_steps (fun i -> IO.Path.Join(uri,sprintf "step%i" (i+1)))
+            log <| sprintf "Starting the relay. The number of steps is %i" num_steps
+            PairSocket.receive_string uri (fun () -> loop uri uri_step)
+            |> sprintf "Received: %s" |> log
 
-        let step2 () =
-            use receiver = new PairSocket()
-            receiver.Bind(uri_step2)
-            let t = Thread(ThreadStart step1)
-            t.Start()
-            receiver.ReceiveSignal() |> ignore
-            use xmitter = new PairSocket()
-            xmitter.Connect(uri_step3)
-            xmitter.SignalOK()
-            xmitter.Disconnect(uri_step3)
+    module WeatherSynchronized =
+        let uri = "ipc://weather_synchronized"
+        let uri_start = IO.Path.Join(uri,"start")
+        let num_subs = 10
+        let num_messages = 1000000
+        let msg_end = "END"
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            try let rand = Random()
+                init PublisherSocket poller (bind uri) <| fun pub ->
+                log <| sprintf "Publisher has bound to %s." uri
+                for i=1 to num_subs do ResponseSocket.sync_receive_string uri_start |> ignore
+                log "Publisher has synced."
+                let i = ref 0
+                use __ = pub.SendReady.Subscribe(fun _ ->  
+                    // get values that will fool the boss
+                    let zipcode, temperature, relhumidity = rand.Next 100000, (rand.Next 215) - 80, (rand.Next 50) + 10
+                    sprintf "%05d %d %d" zipcode temperature relhumidity |> pub.SendFrame
+                    incr i
+                    if !i = num_messages then pub.SendFrame(msg_end); poller.Stop()
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
+            try init SubscriberSocket poller (connect uri) <| fun sub ->
+                SubscriberSocket.subscribe sub filter <| fun _ ->
+                log <| sprintf "Client has connected to %s and subscribed to the topic %s." uri filter
+                RequestSocket.sync_send_string uri_start ""
+                log "Synced with publisher."
+                SubscriberSocket.subscribe sub msg_end <| fun _ ->
+                log <| sprintf "The client is also waiting for %s." msg_end
+
+                let i = ref 0
+                let total_temp = ref 0
+                use __ = sub.ReceiveReady.Subscribe(fun _ ->
+                    let update = sub.ReceiveFrameString()
+                    if update = msg_end then 
+                        log <| sprintf "Got the %s message. Stopping." msg_end
+                        poller.Stop()
+                    else
+                        let zipcode, temperature, relhumidity =
+                            let update' = update.Split()
+                            (int update'.[0]),(int update'.[1]),(int update'.[2])
+                        total_temp := !total_temp + temperature
+                        incr i
+                        log (sprintf "Average temperature for zipcode '%s' since the start of the sequence is %dF" filter (!total_temp / !i))
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+    module PubSubEnvelope =
+        let uri = "ipc://pubsub_envelope"
+        let uri_start = IO.Path.Join(uri,"start")
+        let num_subs = 3
+        let num_messages = 10
+        let msg_end = "END"
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            try init PublisherSocket poller (bind uri) <| fun pub ->
+                log <| sprintf "Publisher has bound to %s." uri
+                init ResponseSocket poller (bind uri_start) <| fun initer ->
+                    for i=1 to num_subs do initer.ReceiveFrameString() |> ignore; initer.SendFrameEmpty()
+                log "Publisher has synced."
+                let i = ref 0
+                use __ = pub.SendReady.Subscribe(fun _ ->  
+                    let f l =
+                        List.mapFoldBack (fun (x : string) s ->
+                            (x,s), true
+                            ) l false
+                        |> fst |> List.iter pub.SendFrame
+                    f ["A"; "We don't want to see this"]
+                    f ["B"; "We would like to see this"]
+                    incr i
+                    if !i = num_messages then log "Done sending messages"; pub.SendFrame(msg_end); poller.Stop()
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
+            try init SubscriberSocket poller (connect uri) <| fun sub ->
+                init RequestSocket poller (connect uri_start) <| fun initer ->
+                    initer.SendFrameEmpty(); initer.ReceiveFrameString() |> ignore
+                log "Synced with publisher."
+                SubscriberSocket.subscribe sub filter <| fun _ ->
+                log <| sprintf "Client has connected to %s and subscribed to the topic %s." uri filter
+                SubscriberSocket.subscribe sub msg_end <| fun _ ->
+                log <| sprintf "The client is also waiting for %s." msg_end
+
+                use __ = sub.ReceiveReady.Subscribe(fun _ ->
+                    let msg = sub.ReceiveMultipartStrings()
+                    if msg.[0] = msg_end then
+                        log <| sprintf "Got the %s message. Stopping." msg_end
+                        poller.Stop()
+                    else
+                        log <| sprintf "Got message: %s" msg.[1]
+                    )
+                poller.Run()
+            with e -> log e.Message
 
 module Lithe = 
     open Avalonia
@@ -454,7 +566,7 @@ module UI =
                     | None ->
                         A 1.0, [text_block [do' <| fun c -> c.Text <- "-----"; Grid.SetColumnSpan(c,2)]]
                     ))
-                prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) obs
+                prop (fun x _ -> x.Offset <- x.Offset.WithY(infinity)) (obs |> Observable.delayOn ui_scheduler (TimeSpan.FromSeconds 0.01))
                 ]
             ]
 
@@ -580,6 +692,19 @@ module UI =
                         "Client 3", MultithreadedService.client
                         "Client 4", MultithreadedService.client
                         |]
+                    tab "Relay Race" [|
+                        "Relay", RelayRace.start
+                        |]
+                    tab "Weather Sync" (
+                        Array.append [|"Server", WeatherSynchronized.server|] <| Array.init WeatherSynchronized.num_subs (fun i -> 
+                            let i=i+1 in sprintf "Client %i" i, WeatherSynchronized.client (sprintf "%05d" (10000+i))
+                            )
+                        )
+                    tab "PubSub Envelope" (
+                        Array.append [|"Server", PubSubEnvelope.server|] <| Array.init PubSubEnvelope.num_subs (fun i -> 
+                            sprintf "Client %i" (i+1), PubSubEnvelope.client "B"
+                            )
+                        )
                     ]
                 ]
             ]
