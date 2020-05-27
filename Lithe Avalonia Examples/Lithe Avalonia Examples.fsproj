@@ -13,17 +13,21 @@
     <Compile Include="03_StackButtons.fs" />
     <Compile Include="04_ZeroMQ_HelloWorld.fs" />
     <Compile Include="05_ZeroMQ.fs" />
-    <Compile Include="ZeroMQBugMinimalExample.fs" />
+    <Compile Include="ZeroMQBugKillSignalMinimalExample.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="0.9.10" />
     <PackageReference Include="Avalonia.Desktop" Version="0.9.10" />
-    <PackageReference Include="FSharp.Control.Reactive" Version="4.2.0" />
+    <PackageReference Include="FSharp.Control.Reactive" Version="4.3.0" />
     <PackageReference Include="FSharpx.Async" Version="1.14.1" />
     <PackageReference Include="NetMQ" Version="4.0.1.2-pre" />
     <PackageReference Include="System.Reactive" Version="4.4.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="4.7.2" />
   </ItemGroup>
 
 </Project>

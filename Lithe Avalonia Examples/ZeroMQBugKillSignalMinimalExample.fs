@@ -37,22 +37,24 @@ module Messaging =
     
     open NetMQSocket
 
-    module DivideAndConquer =
+    module KillSignal =
         let task_number = 100
-        let uri_sender, uri_sink = 
-            let uri = "ipc://divide_and_conquer"
-            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink")
+        let uri_sender, uri_sink, uri_kill, uri_sink_start = 
+            let uri = "ipc://kill_signaling"
+            IO.Path.Join(uri,"sender"), IO.Path.Join(uri,"sink"), IO.Path.Join(uri,"kill"), IO.Path.Join(uri,"sink_start")
 
         let ventilator timeout (log : string -> unit) (poller : NetMQPoller) =
             try let rnd = Random()
                 init PushSocket poller (bind uri_sender) <| fun sender ->
-                init PushSocket poller (connect uri_sink) <| fun sink ->
+                init RequestSocket poller (connect uri_sink_start) <| fun sink ->
                 let tasks = Array.init task_number (fun _ -> rnd.Next 100+1)
                 log <| sprintf "Waiting %ims for the workers to get ready..." timeout
                 Thread.Sleep(timeout)
                 log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
+                log "Starting the sink."
                 sink.SendFrame(string task_number)
-                log <| "Sending tasks to workers."
+                sink.ReceiveMultipartMessage() |> ignore
+                log "Sending tasks to workers."
                 Array.iter (string >> sender.SendFrame) tasks
                 log "Done sending tasks."
             with e -> log e.Message
@@ -60,6 +62,13 @@ module Messaging =
         let worker (log : string -> unit) (poller : NetMQPoller) =
             try init PullSocket poller (connect uri_sender) <| fun sender ->
                 init PushSocket poller (connect uri_sink) <| fun sink ->
+                init SubscriberSocket poller (connect uri_kill) <| fun controller ->
+                SubscriberSocket.subscribe controller "" <| fun _ ->
+                use __ = controller.ReceiveReady.Subscribe(fun _ ->
+                    let _ = controller.ReceiveMultipartMessage()
+                    log "Received kill signal. Stopping."
+                    poller.Stop()
+                    )
                 use __ = sender.ReceiveReady.Subscribe(fun _ ->
                     let msg = sender.ReceiveFrameString()
                     log <| sprintf "Received message %s." msg
@@ -71,13 +80,24 @@ module Messaging =
 
         let sink (log : string -> unit) (poller : NetMQPoller) =
             try init PullSocket poller (bind uri_sink) <| fun sink ->
-                let watch = Diagnostics.Stopwatch()
-                use __ = sink.ReceiveReady.Subscribe(fun _ ->
-                    let _ = sink.ReceiveFrameString()
-                    log <| sprintf "Received message. Time elapsed: %A." watch.Elapsed
-                    if watch.IsRunning = false then watch.Start()
-                    )
-                poller.Run()
+                init ResponseSocket poller (bind uri_sink_start) <| fun sink_start ->
+                let near_to = sink_start.ReceiveFrameString() |> int
+                sink_start.SendFrameEmpty()
+                if near_to <= 0 then log "No tasks to process."
+                else 
+                    log <| sprintf "The number of tasks to process is %i" near_to
+                    init PublisherSocket poller (bind uri_kill) <| fun controller ->
+                    
+                    let watch = Diagnostics.Stopwatch.StartNew()
+                    let from = ref 0
+                    let rest _ =
+                        let _ = sink.ReceiveFrameString()
+                        log <| sprintf "Received message. Time elapsed: %A." watch.Elapsed
+                        incr from
+                        if !from = near_to then controller.SendFrameEmpty(); log "Done with the tasks."; poller.Stop()
+                    
+                    use __ = sink.ReceiveReady.Subscribe(fun x -> rest x)
+                    poller.Run()
             with e -> log e.Message
 
 open Messaging
@@ -93,12 +113,12 @@ let main argv =
     let ignore _ _ = ()
     let l = 
         [|
-        "Ventilator", DivideAndConquer.ventilator 1000, writeline
-        "Worker 1", DivideAndConquer.worker, ignore
-        "Worker 2", DivideAndConquer.worker, ignore
-        "Worker 3", DivideAndConquer.worker, ignore
-        "Worker 4", DivideAndConquer.worker, ignore
-        "Sink", DivideAndConquer.sink, writeline
+        "Ventilator", KillSignal.ventilator 1000, writeline
+        "Worker 1", KillSignal.worker, ignore
+        "Worker 2", KillSignal.worker, ignore
+        "Worker 3", KillSignal.worker, ignore
+        "Worker 4", KillSignal.worker, ignore
+        "Sink", KillSignal.sink, writeline
         |] |> Array.map (fun (a,b,c) -> a,b,c a)
 
     let create () =

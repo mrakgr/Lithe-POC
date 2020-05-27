@@ -20,7 +20,7 @@ module Messaging =
             (pollers, tasks) ||> Array.iter2 (fun a b -> a.Dispose(); b.Dispose())
             )
 
-    let inline t a b x rest = a x; let r = rest() in b x; r
+    let inline t a b x rest = try a x; rest() finally try b x with e -> ()
     module NetMQPoller =
         let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
     module SubscriberSocket =
@@ -213,8 +213,8 @@ module Messaging =
                 init PushSocket poller (bind uri_sender) <| fun sender ->
                 init RequestSocket poller (connect uri_sink_start) <| fun sink ->
                 let tasks = Array.init task_number (fun _ -> rnd.Next 100+1)
-                //log <| sprintf "Waiting %ims for the workers to get ready..." timeout
-                //Thread.Sleep(timeout)
+                log <| sprintf "Waiting %ims for the workers to get ready..." timeout
+                Thread.Sleep(timeout)
                 log <| sprintf "Running - total expected time: %A" (TimeSpan.FromMilliseconds(Array.sum tasks |> float))
                 log "Starting the sink."
                 sink.SendFrame(string task_number)
@@ -545,7 +545,7 @@ module Main =
             base.OnFrameworkInitializationCompleted()
 
     open Avalonia.Logging.Serilog
-    [<CompiledName "BuildAvaloniaApp">] 
+    [<CompiledName "BuildAvaloniaApp">]
     let buildAvaloniaApp () = AppBuilder.Configure<App>().UsePlatformDetect().LogToDebug()
 
     let main argv = buildAvaloniaApp().StartWithClassicDesktopLifetime(argv)
