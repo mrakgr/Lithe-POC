@@ -408,9 +408,7 @@ module Messaging =
                 let i = ref 0
                 use __ = pub.SendReady.Subscribe(fun _ ->  
                     let f l =
-                        List.mapFoldBack (fun (x : string) s ->
-                            (x,s), true
-                            ) l false
+                        List.mapFoldBack (fun (x : string) s -> (x,s), true) l false
                         |> fst |> List.iter pub.SendFrame
                     f ["A"; "We don't want to see this"]
                     f ["B"; "We would like to see this"]
