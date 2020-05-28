@@ -374,7 +374,7 @@ module Messaging =
                 log <| sprintf "Client has connected to %s and subscribed to the topic %s." uri filter
                 RequestSocket.sync_send_string uri_start ""
                 log "Synced with publisher."
-
+                
                 let i = ref 0
                 let total_temp = ref 0
                 use __ = sub.ReceiveReady.Subscribe(fun _ ->
@@ -438,6 +438,26 @@ module Messaging =
                     )
                 poller.Run()
             with e -> log e.Message
+
+    module IdentityCheck =
+        let uri = "inproc://identity_check"
+        let encoding = Text.Encoding.UTF8
+        let main (log : string -> unit) (poller : NetMQPoller) =
+            try init RouterSocket poller (bind uri) <| fun sink ->
+                init RequestSocket poller (connect uri) <| fun anon ->
+                anon.SendFrame("ROUTER uses a generated 5 byte identity")
+                init RequestSocket poller (connect uri) <| fun ided ->
+                ided.Options.Identity <- encoding.GetBytes("PEER2")
+                ided.SendFrame("ROUTER socket uses REQ's socket identity")
+                let a = sink.ReceiveMultipartMessage()
+                log <| sprintf "Got: %s" (a.[2].ConvertToString())
+                let b = sink.ReceiveMultipartMessage()
+                log <| sprintf "Got: %s" (b.[2].ConvertToString(encoding))
+            with e -> log e.Message
+
+    module RouterReq =
+        let worker (log : string -> unit) (poller : NetMQPoller) = ()
+        let router (log : string -> unit) (poller : NetMQPoller) = ()
 
 module Lithe = 
     open Avalonia
@@ -704,6 +724,9 @@ module UI =
                             sprintf "Client %i" (i+1), PubSubEnvelope.client "B"
                             )
                         )
+                    tab "Identity Check" [|
+                        "Main", IdentityCheck.main
+                        |]
                     ]
                 ]
             ]
