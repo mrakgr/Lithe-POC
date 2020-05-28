@@ -352,9 +352,8 @@ module Messaging =
             try let rand = Random()
                 init PublisherSocket poller (bind uri) <| fun pub ->
                 log <| sprintf "Publisher has bound to %s." uri
-                //init ResponseSocket poller (bind uri_start) <| fun initer ->
-                //    for i=1 to num_subs do initer.ReceiveFrameString() |> ignore; initer.SendFrameEmpty()
-                for i=1 to num_subs do ResponseSocket.sync_receive_string uri_start |> ignore
+                init ResponseSocket poller (bind uri_start) <| fun initer ->
+                    for i=1 to num_subs do initer.ReceiveFrameString() |> ignore; initer.SendFrameEmpty()
                 log "Publisher has synced."
                 let i = ref 0
                 use __ = pub.SendReady.Subscribe(fun _ ->  

@@ -13,7 +13,6 @@
     <Compile Include="03_StackButtons.fs" />
     <Compile Include="04_ZeroMQ_HelloWorld.fs" />
     <Compile Include="05_ZeroMQ.fs" />
-    <Compile Include="ZeroMQ_WeatherSyncedBug.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
 
