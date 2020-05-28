@@ -14,7 +14,7 @@ module Messaging =
     let run l =
         let l = l |> Array.map (fun f -> 
             let poller = new NetMQPoller()
-            let thread = Thread(ThreadStart(fun () -> f poller), 1024*16, IsBackground=true)
+            let thread = Thread(ThreadStart(fun () -> f poller),IsBackground=true)
             thread.Start()
             poller, thread)
         Disposable.Create(fun () ->
@@ -352,6 +352,8 @@ module Messaging =
             try let rand = Random()
                 init PublisherSocket poller (bind uri) <| fun pub ->
                 log <| sprintf "Publisher has bound to %s." uri
+                //init ResponseSocket poller (bind uri_start) <| fun initer ->
+                //    for i=1 to num_subs do initer.ReceiveFrameString() |> ignore; initer.SendFrameEmpty()
                 for i=1 to num_subs do ResponseSocket.sync_receive_string uri_start |> ignore
                 log "Publisher has synced."
                 let i = ref 0
@@ -368,11 +370,11 @@ module Messaging =
         let client (filter : string) (log : string -> unit) (poller : NetMQPoller) =
             try init SubscriberSocket poller (connect uri) <| fun sub ->
                 SubscriberSocket.subscribe sub filter <| fun _ ->
+                SubscriberSocket.subscribe sub msg_end <| fun _ ->
+                log <| sprintf "The client is also waiting for %s." msg_end
                 log <| sprintf "Client has connected to %s and subscribed to the topic %s." uri filter
                 RequestSocket.sync_send_string uri_start ""
                 log "Synced with publisher."
-                SubscriberSocket.subscribe sub msg_end <| fun _ ->
-                log <| sprintf "The client is also waiting for %s." msg_end
 
                 let i = ref 0
                 let total_temp = ref 0
