@@ -456,39 +456,41 @@ module Messaging =
             with e -> log e.Message
 
     module RouterReq =
-        let time_run_in_seconds = 1
+        let time_run_in_seconds = 5
         let num_workers = 4
         let msg_fired = "Fired!"
         let uri = "ipc://router_req"
-        let worker (log : string -> unit) (poller : NetMQPoller) =
-            init RequestSocket poller (connect uri) <| fun req ->
+        let worker (log : string -> unit) _ =
+            use req = new RequestSocket()
+            connect uri req <| fun () ->
             log "Connected."
             let rnd = Random()
-            let total = ref 0
-            use __ = req.SendReady.Subscribe(fun _ -> 
+            let rec loop total =
                 req.SendFrame("Hi Boss")
                 let msg = req.ReceiveFrameString()
-                if msg.ToString() = msg_fired then poller.Stop(); log <| sprintf "Completed %d tasks." !total
-                else Thread.Sleep(rnd.Next(1,500)); incr total
-                )
-            poller.Run()
+                if msg.ToString() = msg_fired then log <| sprintf "Completed %d tasks." total
+                else Thread.Sleep(rnd.Next(1,500)); loop (total+1)
+            loop 0
 
         open System.Reactive.Concurrency
         open FSharp.Control.Reactive
-        let broker (log : string -> unit) (poller : NetMQPoller) =
-            init RouterSocket poller (bind uri) <| fun broker ->
+        let broker (log : string -> unit) _ =
+            use broker = new RouterSocket()
+            bind uri broker <| fun () ->
             use __ = Array.init num_workers (fun i -> worker (sprintf "Worker %i: %s" i >> log)) |> run
-            let on_done workers_left () =
+
+            let on_done workers_left next =
                 broker.SendFrame(msg_fired)
                 decr workers_left
-                if !workers_left = 0 then poller.Stop()
-            let proxy = ref (fun () -> broker.SendFrame("Worker harder."))
-            use __ = broker.ReceiveReady.Subscribe(fun _ -> 
+                if !workers_left > 0 then next()
+            let on_work next = broker.SendFrame("Worker harder."); next()
+
+            let proxy = ref on_work 
+            let rec loop () =
                 let msg = broker.ReceiveMultipartMessage()
                 broker.SendFrame(msg.[0].ToByteArray(),true)
                 broker.SendFrameEmpty(true)
-                proxy.Value()
-                )
+                !proxy loop
 
             use __ = 
                 Observable.interval (TimeSpan.FromSeconds 1.0)
@@ -497,7 +499,7 @@ module Messaging =
                     (fun i -> let i = time_run_in_seconds - int i - 1 in if i > 0 then sprintf "%i..." i |> log)
                     (fun () -> log "Done."; proxy := on_done (ref num_workers))
 
-            poller.Run()
+            loop()
 
 module Lithe = 
     open Avalonia
