@@ -25,6 +25,7 @@ module Messaging =
     let inline t a b x rest = try a x; rest() finally try b x with e -> printfn "%s" e.Message
     module NetMQPoller =
         let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
+        let inline add_timer (poller : NetMQPoller) (socket : NetMQTimer) rest = (socket, rest) ||> t poller.Add poller.Remove
 
     module NetMQSocket =
         let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
@@ -512,7 +513,6 @@ module Messaging =
 
     module RouterDealer =
         let uri = "ipc://router_dealer"
-        let uri_init = IO.Path.Join(uri,"init")
         let msg_end = "END"
         let num_tasks = 100
         let worker (identity : string) (log : string -> unit) _ =
@@ -639,6 +639,51 @@ module Messaging =
         //        iter()
         //        )
         //    poller.Run()
+
+    module AsyncServer =
+        let uri_client = "ipc://random_server"
+        let uri_worker = "inproc://random_server"
+        let num_clients = 3
+        let num_workers = 3
+        let client (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(400)
+            init DealerSocket poller (connect uri_client) <| fun client ->
+            log <| sprintf "Client has connected to %s" uri_client
+            let timer = NetMQTimer(1000)
+            NetMQPoller.add_timer poller timer <| fun () ->
+            let i = ref 0
+            use __ = timer.Elapsed.Subscribe(fun _ ->
+                incr i
+                let msg = sprintf "request %i" !i
+                client.SendFrame(msg)
+                msg |> sprintf "Sent: %s" |> log
+                )
+            use __ = client.ReceiveReady.Subscribe(fun _ ->
+                client.ReceiveFrameString() |> sprintf "Got: %s" |> log
+                )
+            poller.Run()
+
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(400)
+            init DealerSocket poller (connect uri_worker) <| fun worker ->
+            log <| sprintf "Worker has connected to %s" uri_worker
+            let rng = Random()
+            use __ = worker.ReceiveReady.Subscribe(fun _ ->
+                let msg = worker.ReceiveMultipartMessage()
+                let replies = rng.Next(5)
+                for i=0 to replies do
+                    Thread.Sleep(rng.Next(750))
+                    worker.SendMultipartMessage(msg)
+                )
+            poller.Run()
+
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            init RouterSocket poller (bind uri_client) <| fun frontend ->
+            log <| sprintf "Frontend has bound to %s" uri_client
+            init DealerSocket poller (bind uri_worker) <| fun backend ->
+            log <| sprintf "Backend has bound to %s" uri_worker
+            Proxy(frontend,backend,null,poller).Start()
+            poller.Run()
 
 module Lithe = 
     open Avalonia
@@ -922,6 +967,12 @@ module UI =
                         let clients = List.init LoadBalancing.num_clients (fun i -> sprintf "Client %i" i, LoadBalancing.client)
                         let workers = List.init LoadBalancing.num_workers (fun i -> sprintf "Worker %i" i, LoadBalancing.worker)
                         balancer :: clients @ workers |> List.toArray
+                        )
+                    tab "Async Server" (
+                        let server = "Server", AsyncServer.server
+                        let clients = List.init AsyncServer.num_clients (fun i -> sprintf "Client %i" i, AsyncServer.client)
+                        let workers = List.init AsyncServer.num_workers (fun i -> sprintf "Worker %i" i, AsyncServer.worker)
+                        server :: clients @ workers |> List.toArray
                         )
                     ]
                 ]
