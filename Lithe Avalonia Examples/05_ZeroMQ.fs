@@ -48,6 +48,15 @@ module Messaging =
             s.SendFrameEmpty()
             r
 
+        // Note: This is broken as of 5/29/2020 since NetMQ is not diposing the sockets properly.
+        let inline sync_receives uri num =
+            use s = new ResponseSocket()
+            bind uri s <| fun () ->
+            for i=1 to num do
+                let _ = s.ReceiveMultipartMessage()
+                s.SendFrameEmpty()
+            
+
     module RequestSocket =
         let inline sync_send_string uri x =
             use s = new RequestSocket()
@@ -501,6 +510,121 @@ module Messaging =
 
             loop()
 
+    module RouterDealer =
+        let uri = "ipc://router_dealer"
+        let uri_init = IO.Path.Join(uri,"init")
+        let msg_end = "END"
+        let num_tasks = 100
+        let worker (identity : string) (log : string -> unit) _ =
+            use worker = new DealerSocket()
+            worker.Options.Identity <- Text.Encoding.Default.GetBytes(identity)
+            connect uri worker <| fun () ->
+            log <| sprintf "Connected to %s" uri
+            let rec loop count =
+                let msg = worker.ReceiveMultipartMessage(2)
+                if msg.[1].ConvertToString() = msg_end then count
+                else loop (count + 1)
+            loop 0 |> sprintf "Received total: %i" |> log
+
+        type Worker = {|name : string; freq : int|}
+        let client (workers : Worker list) (log : string -> unit) _ =
+            use client = new RouterSocket()
+            bind uri client <| fun () ->
+            log <| sprintf "Bound to %s" uri
+            Thread.Sleep(100) // 5/29/2020: Syncing using req/res sockets is even more broken than this after restarts.
+            log "Done waiting."
+            let send (name : string) (b : string) = client.SendFrame(name,true); client.SendFrameEmpty(true); client.SendFrame(b)
+            let dist = workers |> List.map (fun x -> x.freq) |> List.scan (+) 0
+            let near_to = List.last dist
+            let rnd = Random()
+            for _=1 to num_tasks do
+                rnd.Next(near_to)
+                |> fun dist_i -> List.findIndexBack (fun x -> dist_i >= x) dist
+                |> fun sample_i -> workers.[sample_i]
+                |> fun x -> send x.name "This is the workload."
+            for x in workers do send x.name msg_end
+            log "Done."
+
+    module LoadBalancing =
+        let uri_client = "ipc://load_balancing"
+        let uri_worker = "inproc://load_balancing"
+        let num_clients = 10
+        let num_workers = 3
+        let num_client_msgs = 3
+
+        let client (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(400)
+            init RequestSocket poller (connect uri_client) <| fun client ->
+            use __ = client.SendReady.Subscribe(fun _ ->
+                let msg = "Hello"
+                client.SendFrame(msg)
+                sprintf "Sent: %s" msg |> log
+                )
+            let i = ref 0
+            use __ = client.ReceiveReady.Subscribe(fun _ ->
+                client.ReceiveFrameString() |> sprintf "Got: %s" |> log
+                incr i
+                if !i = num_client_msgs then poller.Stop()
+                )
+            poller.Run()
+            log "Done."
+
+        let msg_ready = "READY"
+        let msg_ok = "OK"
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(400)
+            init RequestSocket poller (connect uri_worker) <| fun worker ->
+            worker.SendFrame(msg_ready)
+            sprintf "Sent: %s" msg_ready |> log
+            let rnd = Random()
+            use __ = worker.ReceiveReady.Subscribe(fun _ ->
+                log "Ready to receive."
+                let msg = worker.ReceiveMultipartMessage()
+                let address = msg.Pop()
+                msg.Pop() |> ignore
+                msg.Pop().ConvertToString() |> sprintf "Got: %s" |> log
+                let x = rnd.Next(1,500)
+                sprintf "Waiting for %ims." x |> log
+                Thread.Sleep(x)
+                msg.Append(address)
+                msg.AppendEmptyFrame()
+                msg.Append(msg_ok)
+                worker.SendMultipartMessage(msg)
+                )
+            poller.Run()
+
+        open System.Collections.Generic
+        let balancer (log : string -> unit) (poller : NetMQPoller) =
+            init RouterSocket poller (bind uri_client) <| fun frontend ->
+            log <| sprintf "The frontend is bound to %s" uri_client
+            init RouterSocket poller (bind uri_worker) <| fun backend ->
+            log <| sprintf "The backend is bound to %s" uri_worker
+            let clients = Queue()
+            let workers = Queue()
+            let iter () =
+                if clients.Count > 0 && workers.Count > 0 then
+                    let client : NetMQMessage = clients.Dequeue()
+                    let worker : NetMQFrame = workers.Dequeue()
+                    client.PushEmptyFrame()
+                    client.Push(worker)
+                    backend.SendMultipartMessage(client)
+
+            use __ = frontend.ReceiveReady.Subscribe(fun _ ->
+                let msg = frontend.ReceiveMultipartMessage()
+                clients.Enqueue(msg)
+                iter()
+                )
+            use __ = backend.ReceiveReady.Subscribe(fun _ ->
+                let msg = backend.ReceiveMultipartMessage()
+                let address = msg.Pop()
+                msg.Pop() |> ignore
+                if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
+                workers.Enqueue(address)
+                iter()
+                )
+            poller.Run()
+
+
 module Lithe = 
     open Avalonia
     open Avalonia.Controls
@@ -772,6 +896,18 @@ module UI =
                     tab "Router-Req" [|
                         "Broker", RouterReq.broker
                         |]
+                    tab "Router-Dealer" (
+                        let workers = [{|name="A"; freq=2|}; {|name="B"; freq=1|}]
+                        let client = "Broker", RouterDealer.client workers
+                        let workers = workers |> List.map (fun x -> sprintf "Worker %s" x.name, RouterDealer.worker x.name)
+                        client :: workers |> List.toArray
+                        )
+                    tab "Router-Router" (
+                        let balancer = "Balancer", LoadBalancing.balancer
+                        let clients = List.init LoadBalancing.num_clients (fun i -> sprintf "Client %i" i, LoadBalancing.client)
+                        let workers = List.init LoadBalancing.num_workers (fun i -> sprintf "Worker %i" i, LoadBalancing.worker)
+                        balancer :: clients @ workers |> List.toArray
+                        )
                     ]
                 ]
             ]
