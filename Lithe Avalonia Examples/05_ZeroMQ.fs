@@ -553,7 +553,6 @@ module Messaging =
         let num_client_msgs = 3
 
         let client (log : string -> unit) (poller : NetMQPoller) =
-            Thread.Sleep(400)
             init RequestSocket poller (connect uri_client) <| fun client ->
             use __ = client.SendReady.Subscribe(fun _ ->
                 let msg = "Hello"
@@ -576,54 +575,70 @@ module Messaging =
             init RequestSocket poller (connect uri_worker) <| fun worker ->
             worker.SendFrame(msg_ready)
             sprintf "Sent: %s" msg_ready |> log
-            let rnd = Random()
             use __ = worker.ReceiveReady.Subscribe(fun _ ->
                 log "Ready to receive."
                 let msg = worker.ReceiveMultipartMessage()
                 let address = msg.Pop()
                 msg.Pop() |> ignore
                 msg.Pop().ConvertToString() |> sprintf "Got: %s" |> log
-                let x = rnd.Next(1,500)
-                sprintf "Waiting for %ims." x |> log
-                Thread.Sleep(x)
                 msg.Append(address)
                 msg.AppendEmptyFrame()
                 msg.Append(msg_ok)
                 worker.SendMultipartMessage(msg)
                 )
             poller.Run()
+            log "Done."
 
-        open System.Collections.Generic
+        // Here is a non-polling version of the example, but it cannot be restarted.
         let balancer (log : string -> unit) (poller : NetMQPoller) =
             init RouterSocket poller (bind uri_client) <| fun frontend ->
             log <| sprintf "The frontend is bound to %s" uri_client
             init RouterSocket poller (bind uri_worker) <| fun backend ->
             log <| sprintf "The backend is bound to %s" uri_worker
-            let clients = Queue()
-            let workers = Queue()
-            let iter () =
-                if clients.Count > 0 && workers.Count > 0 then
-                    let client : NetMQMessage = clients.Dequeue()
-                    let worker : NetMQFrame = workers.Dequeue()
-                    client.PushEmptyFrame()
-                    client.Push(worker)
-                    backend.SendMultipartMessage(client)
 
-            use __ = frontend.ReceiveReady.Subscribe(fun _ ->
-                let msg = frontend.ReceiveMultipartMessage()
-                clients.Enqueue(msg)
-                iter()
-                )
-            use __ = backend.ReceiveReady.Subscribe(fun _ ->
-                let msg = backend.ReceiveMultipartMessage()
-                let address = msg.Pop()
-                msg.Pop() |> ignore
-                if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
-                workers.Enqueue(address)
-                iter()
-                )
-            poller.Run()
+            while true do
+                let worker_msg = backend.ReceiveMultipartMessage()
+                let worker_address = worker_msg.Pop()
+                worker_msg.Pop() |> ignore
+                if worker_msg.FrameCount > 1 then frontend.SendMultipartMessage(worker_msg)
+                let client_msg = frontend.ReceiveMultipartMessage()
+                client_msg.PushEmptyFrame()
+                client_msg.Push(worker_address)
+                backend.SendMultipartMessage(client_msg)
 
+        //open System.Collections.Generic
+        //// This one in theory can be restarted, but binding, unbinding and binding a socket is fraught with peril on NetMQ as of 5/29/2020.
+        //// It uses two queues unlike the guide example as there is no easy way to do the polling trick the C version does.
+        //// I could try removing and adding the frontend subscription, but I don't dare it.
+        //let balancer (log : string -> unit) (poller : NetMQPoller) =
+        //    init RouterSocket poller (bind uri_client) <| fun frontend ->
+        //    log <| sprintf "The frontend is bound to %s" uri_client
+        //    init RouterSocket poller (bind uri_worker) <| fun backend ->
+        //    log <| sprintf "The backend is bound to %s" uri_worker
+        //    let clients = Queue()
+        //    let workers = Queue()
+        //    let iter () =
+        //        if clients.Count > 0 && workers.Count > 0 then
+        //            let client : NetMQMessage = clients.Dequeue()
+        //            let worker : NetMQFrame = workers.Dequeue()
+        //            client.PushEmptyFrame()
+        //            client.Push(worker)
+        //            backend.SendMultipartMessage(client)
+
+        //    use __ = frontend.ReceiveReady.Subscribe(fun _ ->
+        //        let msg = frontend.ReceiveMultipartMessage()
+        //        clients.Enqueue(msg)
+        //        iter()
+        //        )
+        //    use __ = backend.ReceiveReady.Subscribe(fun _ ->
+        //        let msg = backend.ReceiveMultipartMessage()
+        //        let address = msg.Pop()
+        //        msg.Pop() |> ignore
+        //        if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
+        //        workers.Enqueue(address)
+        //        iter()
+        //        )
+        //    poller.Run()
 
 module Lithe = 
     open Avalonia
