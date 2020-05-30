@@ -698,6 +698,116 @@ module Messaging =
                 )
             poller.Run()
 
+    module PeeringLocalCloudPrototype =
+        let uri name = sprintf "ipc://peering_local_cloud_prototype/%s" name
+        let join l = IO.Path.Join(l |> List.toArray)
+        let client' = "client"
+        let worker' = "worker"
+        let cloud = "cloud"
+        let num_clients = 10
+        let num_workers = 3
+        let num_client_msgs = 30 // With 30 msgs per client I get the queue empty error every time. With 3 or 5 it can finish.
+
+        let client name (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(1000)
+            let uri_client = join [uri name; client']
+            init RequestSocket poller (connect uri_client) <| fun client ->
+            for i=1 to num_client_msgs do
+                let msg = "Hello"
+                client.SendFrame(msg)
+                sprintf "Sent: %s" msg |> log
+                client.ReceiveFrameString() |> sprintf "Got: %s" |> log
+            log "Done."
+
+        let msg_ready = "READY"
+        let msg_ok = "World"
+        let worker name (log : string -> unit) (poller : NetMQPoller) =
+            let uri_worker = join [uri name; worker']
+            init RequestSocket poller (connect uri_worker) <| fun worker ->
+            worker.SendFrame(msg_ready)
+            sprintf "Sent: %s" msg_ready |> log
+            use __ = worker.ReceiveReady.Subscribe(fun _ ->
+                let msg = worker.ReceiveMultipartMessage()
+                let ret = sprintf "%s %s" (msg.Last.ConvertToString()) msg_ok
+                msg.RemoveFrame(msg.Last) |> ignore
+                msg.Append(ret)
+                worker.SendMultipartMessage(msg)
+                )
+            poller.Run()
+            log "Done."
+
+        open System.Collections.Generic
+        // This things has a bug in that the queue can get empty sometimes.
+        // At this point though, I find it impossible to reason about why this is happening.
+        // My assumption that `switch_frontend` is free of data races is clearly wrong.
+        // The bug goes away when you don't do routing though.
+        let balancer name_self name_rest (log : string -> unit) (poller : NetMQPoller) =
+            let uri_self = uri name_self
+            let uri' = join [uri_self; worker']
+            init RouterSocket poller (bind uri') <| fun backend_local ->
+            log <| sprintf "The local backend is bound to %s" uri'
+            let uri' = List.map (fun name -> join [uri name; client'; cloud]) name_rest
+            init RouterSocket poller (connect' uri') <| fun backend_cloud ->
+            log <| sprintf "The cloud backend is connected to %s" (String.concat " & " uri')
+            let uri' = join [uri_self; client']
+            init RouterSocket poller (bind uri') <| fun frontend_local ->
+            log <| sprintf "The local frontend is bound to %s" uri'
+            let uri' = join [uri_self; client'; cloud]
+            init RouterSocket poller (bind uri') <| fun frontend_cloud ->
+            log <| sprintf "The cloud frontend is bound to %s" uri'
+
+            let id_self = Text.Encoding.Default.GetBytes(name_self)
+            backend_cloud.Options.Identity <- id_self
+            frontend_cloud.Options.Identity <- id_self
+            
+            let id_rest = name_rest |> List.map Text.Encoding.Default.GetBytes
+            let switch_frontend =
+                let remove () = poller.Remove(frontend_cloud); poller.Remove(frontend_local)
+                let add () = poller.Add(frontend_local); poller.Add(frontend_cloud)
+                remove ()
+                let mutable old = false
+                fun x -> if old <> x then (if x then add() else remove()); old <- x
+
+            let workers = Queue()
+            let enqueue x = workers.Enqueue(x); switch_frontend true
+            let dequeue () = let x = workers.Dequeue() in switch_frontend(workers.Count > 0); x
+
+            use __ = backend_local.ReceiveReady.Subscribe(fun _ ->
+                let msg = backend_local.ReceiveMultipartMessage()
+                let address = msg.Pop()
+                msg.Pop() |> ignore
+                if msg.FrameCount % 2 <> 1 then failwith "impossible"
+                match msg.FrameCount / 2 with
+                | 0 -> () // ready
+                | 1 -> frontend_local.SendMultipartMessage(msg) // local message
+                | c -> frontend_cloud.SendMultipartMessage(msg) // routed message
+                enqueue address
+                )
+            use __ = backend_cloud.ReceiveReady.Subscribe(fun _ ->
+                let msg = backend_cloud.ReceiveMultipartMessage()
+                let address = msg.Pop()
+                msg.Pop() |> ignore
+                match msg.FrameCount / 2 with
+                | 1 -> frontend_local.SendMultipartMessage(msg) // local message
+                | c -> frontend_cloud.SendMultipartMessage(msg) // routed message
+                )
+            let rnd = Random()
+            let f (x : NetMQSocketEventArgs) = 
+                let msg = x.Socket.ReceiveMultipartMessage()
+                msg.PushEmptyFrame()
+                // This part is a bit different from the guide as it is possible for message to be rerouted an arbitrary number of times.
+                // The queue empty error does not happen without routing. When the first branch is disabled it works fine.
+                if rnd.Next(5) = 0 then 
+                    let r = id_rest.[rnd.Next(List.length id_rest)]
+                    msg.Push(r)
+                    backend_cloud.SendMultipartMessage(msg)
+                else
+                    msg.Push(dequeue())
+                    backend_local.SendMultipartMessage(msg)
+            use __ = frontend_local.ReceiveReady.Subscribe f
+            use __ = frontend_cloud.ReceiveReady.Subscribe f
+            poller.Run()
+
 module Lithe = 
     open Avalonia
     open Avalonia.Controls
@@ -987,11 +1097,24 @@ module UI =
                         let workers = List.init AsyncServer.num_workers (fun i -> sprintf "Worker %i" i, AsyncServer.worker)
                         server :: clients @ workers |> List.toArray
                         )
-                    tab "Clustering State Prototype" (
+                    tab "Peering State Prototype" (
                         Array.unfold(function
                             | (x :: xs as l, c) when c > 0 -> Some(l, (xs @ [x], c-1))
                             | _ -> None) (let l = ["A"; "B"; "C"] in l, List.length l)
                         |> Array.map (function (name :: rest) -> sprintf "Pub %s" name, PeeringStatePrototype.state name rest | _ -> failwith "impossible")
+                        )
+                    tab "Peering Local Cloud Prototype" (
+                        Array.unfold(function
+                            | (x :: xs as l, c) when c > 0 -> Some(l, (xs @ [x], c-1))
+                            | _ -> None) (let l = ["A"; "B"; "C"] in l, List.length l)
+                        |> Array.collect (function 
+                            | (name :: rest) -> 
+                                let balancer = sprintf "Balancer %s" name, PeeringLocalCloudPrototype.balancer name rest
+                                let clients = List.init PeeringLocalCloudPrototype.num_clients (fun i -> sprintf "Client %s-%i" name i, PeeringLocalCloudPrototype.client name)
+                                let workers = List.init PeeringLocalCloudPrototype.num_workers (fun i -> sprintf "Worker %s-%i" name i, PeeringLocalCloudPrototype.worker name)
+                                balancer :: clients @ workers |> List.toArray
+                            | _ -> failwith "impossible"
+                            )
                         )
                     ]
                 ]
