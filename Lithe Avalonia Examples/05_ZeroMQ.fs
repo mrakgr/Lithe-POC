@@ -30,6 +30,7 @@ module Messaging =
     module NetMQSocket =
         let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
         let inline connect uri (socket : NetMQSocket) rest = t socket.Connect socket.Disconnect uri rest
+        let inline connect' uri (socket : NetMQSocket) rest = t (List.iter socket.Connect) (List.rev >> List.iter socket.Disconnect) uri rest
         let inline init (socket_create : unit -> #NetMQSocket) (poller : NetMQPoller) (connector : #NetMQSocket -> (unit -> 'r) -> 'r) rest =
             use socket = socket_create()
             NetMQPoller.add poller socket <| fun () ->
@@ -84,6 +85,7 @@ module Messaging =
         let server (log : string -> unit) (poller: NetMQPoller) =
             try init ResponseSocket poller (bind uri) <| fun server ->
                 log <| sprintf "Server has bound to: %s" uri
+                
                 use __ = server.ReceiveReady.Subscribe(fun x ->
                     let x = server.ReceiveFrameString()
                     log (sprintf "Server received %s" x)
@@ -545,7 +547,7 @@ module Messaging =
             for x in workers do send x.name msg_end
             log "Done."
 
-    module LoadBalancing =
+    module RouterRouter =
         let uri_client = "ipc://load_balancing"
         let uri_worker = "inproc://load_balancing"
         let num_clients = 10
@@ -589,56 +591,40 @@ module Messaging =
             poller.Run()
             log "Done."
 
-        // Here is a non-polling version of the example, but it cannot be restarted.
+        open System.Collections.Generic
         let balancer (log : string -> unit) (poller : NetMQPoller) =
-            init RouterSocket poller (bind uri_client) <| fun frontend ->
-            log <| sprintf "The frontend is bound to %s" uri_client
             init RouterSocket poller (bind uri_worker) <| fun backend ->
             log <| sprintf "The backend is bound to %s" uri_worker
+            init RouterSocket poller (bind uri_client) <| fun frontend ->
+            log <| sprintf "The frontend is bound to %s" uri_client
+            
+            let switch_frontend =
+                poller.Remove(frontend)
+                let mutable old = false
+                fun x -> 
+                    if old <> x then
+                        if x then poller.Add(frontend)
+                        else poller.Remove(frontend)
+                        old <- x
 
-            while true do
-                let worker_msg = backend.ReceiveMultipartMessage()
-                let worker_address = worker_msg.Pop()
-                worker_msg.Pop() |> ignore
-                if worker_msg.FrameCount > 1 then frontend.SendMultipartMessage(worker_msg)
-                let client_msg = frontend.ReceiveMultipartMessage()
-                client_msg.PushEmptyFrame()
-                client_msg.Push(worker_address)
-                backend.SendMultipartMessage(client_msg)
+            let workers = Queue()
+            let enqueue x = workers.Enqueue(x); switch_frontend true
+            let dequeue () = let x = workers.Dequeue() in switch_frontend(workers.Count > 0); x
 
-        //open System.Collections.Generic
-        //// This one in theory can be restarted, but binding, unbinding and binding a socket is fraught with peril on NetMQ as of 5/29/2020.
-        //// It uses two queues unlike the guide example as there is no easy way to do the polling trick the C version does.
-        //// I could try removing and adding the frontend subscription, but I don't dare it.
-        //let balancer (log : string -> unit) (poller : NetMQPoller) =
-        //    init RouterSocket poller (bind uri_client) <| fun frontend ->
-        //    log <| sprintf "The frontend is bound to %s" uri_client
-        //    init RouterSocket poller (bind uri_worker) <| fun backend ->
-        //    log <| sprintf "The backend is bound to %s" uri_worker
-        //    let clients = Queue()
-        //    let workers = Queue()
-        //    let iter () =
-        //        if clients.Count > 0 && workers.Count > 0 then
-        //            let client : NetMQMessage = clients.Dequeue()
-        //            let worker : NetMQFrame = workers.Dequeue()
-        //            client.PushEmptyFrame()
-        //            client.Push(worker)
-        //            backend.SendMultipartMessage(client)
-
-        //    use __ = frontend.ReceiveReady.Subscribe(fun _ ->
-        //        let msg = frontend.ReceiveMultipartMessage()
-        //        clients.Enqueue(msg)
-        //        iter()
-        //        )
-        //    use __ = backend.ReceiveReady.Subscribe(fun _ ->
-        //        let msg = backend.ReceiveMultipartMessage()
-        //        let address = msg.Pop()
-        //        msg.Pop() |> ignore
-        //        if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
-        //        workers.Enqueue(address)
-        //        iter()
-        //        )
-        //    poller.Run()
+            use __ = backend.ReceiveReady.Subscribe(fun _ ->
+                let msg = backend.ReceiveMultipartMessage()
+                let address = msg.Pop()
+                msg.Pop() |> ignore
+                if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
+                enqueue address
+                )
+            use __ = frontend.ReceiveReady.Subscribe(fun _ ->
+                let msg = frontend.ReceiveMultipartMessage()
+                msg.PushEmptyFrame()
+                msg.Push(dequeue())
+                backend.SendMultipartMessage(msg)
+                )
+            poller.Run()
 
     module AsyncServer =
         let uri_client = "ipc://random_server"
@@ -683,6 +669,33 @@ module Messaging =
             init DealerSocket poller (bind uri_worker) <| fun backend ->
             log <| sprintf "Backend has bound to %s" uri_worker
             Proxy(frontend,backend,null,poller).Start()
+            poller.Run()
+
+    module PeeringStatePrototype =
+        let uri_workers_avail name = sprintf "ipc://peering_state_prototype/%s/workers_avail" name
+        let state name_self name_rest (log : string -> unit) (poller : NetMQPoller) =
+            let uri_self = uri_workers_avail name_self
+            let uri_rest = List.map uri_workers_avail name_rest
+            init PublisherSocket poller (bind uri_self) <| fun statebe ->
+            log <| sprintf "%s has bound to %s" name_self uri_self
+            init SubscriberSocket poller (connect' uri_rest) <| fun statefe ->
+            log <| sprintf "%s has connected to %s" name_self (String.concat " & " uri_rest)
+            statefe.SubscribeToAnyTopic()
+            let timer = NetMQTimer(1000)
+            NetMQPoller.add_timer poller timer <| fun () ->
+            let rnd = Random()
+            use __ = timer.Elapsed.Subscribe(fun _ ->
+                let msg = NetMQMessage()
+                msg.Append(uri_self)
+                msg.Append(rnd.Next(10))
+                statebe.SendMultipartMessage(msg)
+                )
+            use __ = statefe.ReceiveReady.Subscribe(fun _ ->
+                let msg = statefe.ReceiveMultipartMessage(2)
+                let uri = msg.[0].ConvertToString()
+                let workers_avail = msg.[1].ConvertToInt32()
+                log <| sprintf "%s has %i workers free." uri workers_avail
+                )
             poller.Run()
 
 module Lithe = 
@@ -963,9 +976,9 @@ module UI =
                         client :: workers |> List.toArray
                         )
                     tab "Router-Router" (
-                        let balancer = "Balancer", LoadBalancing.balancer
-                        let clients = List.init LoadBalancing.num_clients (fun i -> sprintf "Client %i" i, LoadBalancing.client)
-                        let workers = List.init LoadBalancing.num_workers (fun i -> sprintf "Worker %i" i, LoadBalancing.worker)
+                        let balancer = "Balancer", RouterRouter.balancer
+                        let clients = List.init RouterRouter.num_clients (fun i -> sprintf "Client %i" i, RouterRouter.client)
+                        let workers = List.init RouterRouter.num_workers (fun i -> sprintf "Worker %i" i, RouterRouter.worker)
                         balancer :: clients @ workers |> List.toArray
                         )
                     tab "Async Server" (
@@ -973,6 +986,12 @@ module UI =
                         let clients = List.init AsyncServer.num_clients (fun i -> sprintf "Client %i" i, AsyncServer.client)
                         let workers = List.init AsyncServer.num_workers (fun i -> sprintf "Worker %i" i, AsyncServer.worker)
                         server :: clients @ workers |> List.toArray
+                        )
+                    tab "Clustering State Prototype" (
+                        Array.unfold(function
+                            | (x :: xs as l, c) when c > 0 -> Some(l, (xs @ [x], c-1))
+                            | _ -> None) (let l = ["A"; "B"; "C"] in l, List.length l)
+                        |> Array.map (function (name :: rest) -> sprintf "Pub %s" name, PeeringStatePrototype.state name rest | _ -> failwith "impossible")
                         )
                     ]
                 ]
