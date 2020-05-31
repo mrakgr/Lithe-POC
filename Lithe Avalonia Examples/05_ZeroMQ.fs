@@ -598,7 +598,10 @@ module Messaging =
             init RouterSocket poller (bind uri_client) <| fun frontend ->
             log <| sprintf "The frontend is bound to %s" uri_client
             
-            let switch_frontend =
+            // Note: Using this pattern got me into trouble on the peering example.
+            // It seems to be fine on this example, but on other cases it can run into data race issues
+            // with dequeue being called on the empty worker queue.
+            let switch_frontend = 
                 poller.Remove(frontend)
                 let mutable old = false
                 fun x -> 
@@ -706,10 +709,9 @@ module Messaging =
         let cloud = "cloud"
         let num_clients = 10
         let num_workers = 3
-        let num_client_msgs = 30 // With 30 msgs per client I get the queue empty error every time. With 3 or 5 it can finish.
+        let num_client_msgs = 5
 
         let client name (log : string -> unit) (poller : NetMQPoller) =
-            Thread.Sleep(1000)
             let uri_client = join [uri name; client']
             init RequestSocket poller (connect uri_client) <| fun client ->
             for i=1 to num_client_msgs do
@@ -737,10 +739,6 @@ module Messaging =
             log "Done."
 
         open System.Collections.Generic
-        // This things has a bug in that the queue can get empty sometimes.
-        // At this point though, I find it impossible to reason about why this is happening.
-        // My assumption that `switch_frontend` is free of data races is clearly wrong.
-        // The bug goes away when you don't do routing though.
         let balancer name_self name_rest (log : string -> unit) (poller : NetMQPoller) =
             let uri_self = uri name_self
             let uri' = join [uri_self; worker']
@@ -748,6 +746,7 @@ module Messaging =
             log <| sprintf "The local backend is bound to %s" uri'
             let uri' = List.map (fun name -> join [uri name; client'; cloud]) name_rest
             init RouterSocket poller (connect' uri') <| fun backend_cloud ->
+            backend_cloud.Options.RouterMandatory <- true
             log <| sprintf "The cloud backend is connected to %s" (String.concat " & " uri')
             let uri' = join [uri_self; client']
             init RouterSocket poller (bind uri') <| fun frontend_local ->
@@ -757,55 +756,179 @@ module Messaging =
             log <| sprintf "The cloud frontend is bound to %s" uri'
 
             let id_self = Text.Encoding.Default.GetBytes(name_self)
-            backend_cloud.Options.Identity <- id_self
-            frontend_cloud.Options.Identity <- id_self
-            
+            // TODO: I thought to implement hop shortcutting on return, but return addresses get garbled even with the identity set
+            // for some reason. Why is that? Do the return channels all have to be unique? Also why does `C` never show up in
+            // the printouts?
+            //backend_cloud.Options.Identity <- id_self // Does not work as intended.
+            frontend_cloud.Options.Identity <- id_self // This is necessary. Destinations have to have fixed addresses.
+
             let id_rest = name_rest |> List.map Text.Encoding.Default.GetBytes
-            let switch_frontend =
-                let remove () = poller.Remove(frontend_cloud); poller.Remove(frontend_local)
-                let add () = poller.Add(frontend_local); poller.Add(frontend_cloud)
-                remove ()
-                let mutable old = false
-                fun x -> if old <> x then (if x then add() else remove()); old <- x
-
+            // After trying out various other ways of doing it, this is the only pattern that I've found that actually works
+            // with the way NetMQ does polling. Even though the guide assures me adding and removing sockets from the poller
+            // is thread safe, the attempt to take advantage of that quickly ran into issues with the callbacks being triggered 
+            // even for removed sockets.
             let workers = Queue()
-            let enqueue x = workers.Enqueue(x); switch_frontend true
-            let dequeue () = let x = workers.Dequeue() in switch_frontend(workers.Count > 0); x
+            let clients = Queue()
 
-            use __ = backend_local.ReceiveReady.Subscribe(fun _ ->
-                let msg = backend_local.ReceiveMultipartMessage()
+            let queue_try_work () =
+                if clients.Count > 0 && workers.Count > 0 then
+                    let client : NetMQMessage = clients.Dequeue()
+                    let worker : NetMQFrame = workers.Dequeue()
+                    client.PushEmptyFrame()
+                    client.Push(worker)
+                    backend_local.SendMultipartMessage(client)
+
+            let print_message (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> x.ConvertToString()) |> String.concat " | " |> log
+            let backend_handle (x : NetMQSocketEventArgs) =
+                let msg = x.Socket.ReceiveMultipartMessage()
                 let address = msg.Pop()
                 msg.Pop() |> ignore
-                if msg.FrameCount % 2 <> 1 then failwith "impossible"
                 match msg.FrameCount / 2 with
                 | 0 -> () // ready
                 | 1 -> frontend_local.SendMultipartMessage(msg) // local message
                 | c -> frontend_cloud.SendMultipartMessage(msg) // routed message
-                enqueue address
+                address
+
+            use __ = backend_local.ReceiveReady.Subscribe(backend_handle >> workers.Enqueue >> queue_try_work)
+            use __ = backend_cloud.ReceiveReady.Subscribe(backend_handle >> ignore)
+            let rnd = Random()
+            let frontend_handle (x : NetMQSocketEventArgs) = 
+                let msg = x.Socket.ReceiveMultipartMessage()
+                
+                // This part is a bit different from the guide as it is possible for message to be rerouted an arbitrary number of times.
+                if rnd.Next(5) = 0 then 
+                    msg.PushEmptyFrame()
+                    let r = id_rest.[rnd.Next(List.length id_rest)]
+                    msg.Push(r)
+
+                    let rec try_send msg =
+                        try backend_cloud.SendMultipartMessage(msg)
+                        with :? HostUnreachableException -> Thread.Sleep(500); try_send msg
+                    try_send msg
+                else
+                    clients.Enqueue(msg)
+                    queue_try_work()
+            use __ = frontend_local.ReceiveReady.Subscribe frontend_handle
+            use __ = frontend_cloud.ReceiveReady.Subscribe frontend_handle
+            poller.Run()
+
+    module PeeringFull =
+        let uri name = sprintf "ipc://peering_full/%s" name
+        let join l = IO.Path.Join(l |> List.toArray)
+        let client' = "client"
+        let worker' = "worker"
+        let cloud = "cloud"
+        let monitor = "monitor"
+        let num_clients = 10
+        let num_workers = 3
+        let num_client_msgs = 5
+
+        let client id name_cluster (log : string -> unit) (poller : NetMQPoller) =
+            let uri_client = join [uri name_cluster; client']
+            init RequestSocket poller (connect uri_client) <| fun client ->
+            let uri_monitor = join [uri name_cluster; monitor]
+            init PushSocket poller (connect uri_monitor) <| fun monitor ->
+            let rec loop i =
+                Thread.Sleep(5)
+                if i < num_client_msgs then
+                    let msg = "Hello"
+                    client.SendFrame(msg)
+                    sprintf "Sent: %s" msg |> log
+                    let s = ref null
+                    if client.TryReceiveFrameString(TimeSpan.FromSeconds 4.0, s) then !s |> sprintf "Got: %s" |> log; loop (i+1)
+                    else
+                        monitor.SendFrame(sprintf "Client %s-%i failed." name_cluster id)
+                        log "Request failed."
+                else
+                    monitor.SendFrame(sprintf "Client %s-%i done." name_cluster id)
+                    log "Done."
+            loop 0
+
+        let msg_ready = "READY"
+        let msg_ok = "World"
+        let worker name_cluster (log : string -> unit) (poller : NetMQPoller) =
+            let uri_worker = join [uri name_cluster; worker']
+            init RequestSocket poller (connect uri_worker) <| fun worker ->
+            worker.SendFrame(msg_ready)
+            sprintf "Sent: %s" msg_ready |> log
+            use __ = worker.ReceiveReady.Subscribe(fun _ ->
+                let msg = worker.ReceiveMultipartMessage()
+                Thread.Sleep(2)
+                worker.SendMultipartMessage(msg)
                 )
-            use __ = backend_cloud.ReceiveReady.Subscribe(fun _ ->
-                let msg = backend_cloud.ReceiveMultipartMessage()
+            poller.Run()
+            log "Done."
+
+        open System.Collections.Generic
+        let balancer name_self name_rest (log : string -> unit) (poller : NetMQPoller) =
+            let uri_self = uri name_self
+            let uri' = join [uri_self; worker']
+            init RouterSocket poller (bind uri') <| fun backend_local ->
+            log <| sprintf "The local backend is bound to %s" uri'
+            let uri' = List.map (fun name -> join [uri name; client'; cloud]) name_rest
+            init RouterSocket poller (connect' uri') <| fun backend_cloud ->
+            log <| sprintf "The cloud backend is connected to %s" (String.concat " & " uri')
+            backend_cloud.Options.RouterMandatory <- true
+            let uri' = join [uri_self; client']
+            init RouterSocket poller (bind uri') <| fun frontend_local ->
+            log <| sprintf "The local frontend is bound to %s" uri'
+            let uri' = join [uri_self; client'; cloud]
+            init RouterSocket poller (bind uri') <| fun frontend_cloud ->
+            log <| sprintf "The cloud frontend is bound to %s" uri'
+
+            let id_self = Text.Encoding.Default.GetBytes(name_self)
+            frontend_cloud.Options.Identity <- id_self
+
+            let id_rest = name_rest |> List.map Text.Encoding.Default.GetBytes
+            let workers_cloud = Dictionary()
+            let workers = Queue()
+            let clients = Queue()
+
+            let rnd = Random()
+            let worker_cloud_sample on_succ =
+                let dist = Seq.toArray workers_cloud
+                let dist_cdf = dist |> Array.scan (fun s x -> s + x.Value) 0
+                let max = Array.last dist_cdf
+                if max > 0 then
+                    let i = rnd.Next(max)
+                    let i = Array.findIndexBack (fun x -> i >= x) dist_cdf
+                    on_succ dist.[i].Key
+
+            let queue_try_work () =
+                if clients.Count > 0 then
+                    if workers.Count > 0 then
+                        let client : NetMQMessage = clients.Dequeue()
+                        let worker : NetMQFrame = workers.Dequeue()
+                        client.PushEmptyFrame()
+                        client.Push(worker)
+                        backend_local.SendMultipartMessage(client)
+                    else
+                        worker_cloud_sample <| fun (id : NetMQFrame) ->
+                            let client = clients.Dequeue()
+                            client.PushEmptyFrame()
+                            client.Push(id)
+                            backend_cloud.SendMultipartMessage(client)
+
+            let print_message (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> x.ConvertToString()) |> String.concat " | " |> log
+            let backend_handle (x : NetMQSocketEventArgs) =
+                let msg = x.Socket.ReceiveMultipartMessage()
                 let address = msg.Pop()
                 msg.Pop() |> ignore
                 match msg.FrameCount / 2 with
+                | 0 -> () // ready
                 | 1 -> frontend_local.SendMultipartMessage(msg) // local message
                 | c -> frontend_cloud.SendMultipartMessage(msg) // routed message
-                )
-            let rnd = Random()
-            let f (x : NetMQSocketEventArgs) = 
+                address
+
+            use __ = backend_local.ReceiveReady.Subscribe(backend_handle >> workers.Enqueue >> queue_try_work)
+            use __ = backend_cloud.ReceiveReady.Subscribe(backend_handle >> ignore)
+            
+            let frontend_handle (x : NetMQSocketEventArgs) = 
                 let msg = x.Socket.ReceiveMultipartMessage()
-                msg.PushEmptyFrame()
-                // This part is a bit different from the guide as it is possible for message to be rerouted an arbitrary number of times.
-                // The queue empty error does not happen without routing. When the first branch is disabled it works fine.
-                if rnd.Next(5) = 0 then 
-                    let r = id_rest.[rnd.Next(List.length id_rest)]
-                    msg.Push(r)
-                    backend_cloud.SendMultipartMessage(msg)
-                else
-                    msg.Push(dequeue())
-                    backend_local.SendMultipartMessage(msg)
-            use __ = frontend_local.ReceiveReady.Subscribe f
-            use __ = frontend_cloud.ReceiveReady.Subscribe f
+                clients.Enqueue(msg)
+                queue_try_work()
+            use __ = frontend_local.ReceiveReady.Subscribe frontend_handle
+            use __ = frontend_cloud.ReceiveReady.Subscribe frontend_handle
             poller.Run()
 
 module Lithe = 
