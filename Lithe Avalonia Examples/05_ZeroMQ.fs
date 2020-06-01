@@ -11,6 +11,7 @@ module Messaging =
     open NetMQ.Sockets
     open System.Reactive.Disposables
 
+
     let run l =
         let l = l |> Array.map (fun f -> 
             let poller = new NetMQPoller()
@@ -77,6 +78,9 @@ module Messaging =
             use receiver = new PairSocket()
             connect uri receiver <| fun () ->
             receiver.SendFrame(x)
+
+    module NetMQMessage =
+        let show (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> x.ConvertToString()) |> String.concat " | "
 
     module HelloWorld =
         let msg_num = 3
@@ -778,7 +782,6 @@ module Messaging =
                     client.Push(worker)
                     backend_local.SendMultipartMessage(client)
 
-            let print_message (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> x.ConvertToString()) |> String.concat " | " |> log
             let backend_handle (x : NetMQSocketEventArgs) =
                 let msg = x.Socket.ReceiveMultipartMessage()
                 let address = msg.Pop()
@@ -814,60 +817,63 @@ module Messaging =
 
     module PeeringFull =
         let uri name = sprintf "ipc://peering_full/%s" name
+        let uri_workers_available = uri "workers_available"
+        let uri_workers_available_push = uri "workers_available/push"
         let join l = IO.Path.Join(l |> List.toArray)
         let client' = "client"
         let worker' = "worker"
         let cloud = "cloud"
-        let monitor = "monitor"
         let num_clients = 10
         let num_workers = 3
-        let num_client_msgs = 5
+        let num_client_msgs = 50
+                
+        let publisher (log : string -> unit) (poller : NetMQPoller) =
+            init PullSocket poller (bind uri_workers_available_push) <| fun monitor ->
+            log <| sprintf "Monitor has bound to: %s" uri_workers_available_push
+            init PublisherSocket poller (bind uri_workers_available) <| fun pub ->
+            log <| sprintf "Publisher has bound to: %s" uri_workers_available
 
-        let client id name_cluster (log : string -> unit) (poller : NetMQPoller) =
+            use __ = monitor.ReceiveReady.Subscribe(fun x -> x.Socket.ReceiveMultipartMessage(2) |> pub.SendMultipartMessage)
+            poller.Run()
+
+        let task_id = let i = ref 0 in fun () -> Interlocked.Add(i,1)
+        let client name_cluster (log : string -> unit) (poller : NetMQPoller) =
             let uri_client = join [uri name_cluster; client']
             init RequestSocket poller (connect uri_client) <| fun client ->
-            let uri_monitor = join [uri name_cluster; monitor]
-            init PushSocket poller (connect uri_monitor) <| fun monitor ->
             let rec loop i =
-                Thread.Sleep(5)
                 if i < num_client_msgs then
-                    let msg = "Hello"
-                    client.SendFrame(msg)
-                    sprintf "Sent: %s" msg |> log
-                    let s = ref null
-                    if client.TryReceiveFrameString(TimeSpan.FromSeconds 4.0, s) then !s |> sprintf "Got: %s" |> log; loop (i+1)
-                    else
-                        monitor.SendFrame(sprintf "Client %s-%i failed." name_cluster id)
-                        log "Request failed."
-                else
-                    monitor.SendFrame(sprintf "Client %s-%i done." name_cluster id)
-                    log "Done."
+                    let msg = task_id()
+                    client.SendFrame(sprintf "task_id: %i" msg)
+                    //sprintf "Sent task: %i" msg |> log
+                    client.ReceiveFrameString() 
+                    //|> sprintf "Got: %s" |> log
+                    loop (i+1)
+                else log "Done."
             loop 0
 
         let msg_ready = "READY"
-        let msg_ok = "World"
         let worker name_cluster (log : string -> unit) (poller : NetMQPoller) =
             let uri_worker = join [uri name_cluster; worker']
             init RequestSocket poller (connect uri_worker) <| fun worker ->
             worker.SendFrame(msg_ready)
             sprintf "Sent: %s" msg_ready |> log
+            let rnd = Random()
             use __ = worker.ReceiveReady.Subscribe(fun _ ->
                 let msg = worker.ReceiveMultipartMessage()
-                Thread.Sleep(2)
+                Thread.Sleep(rnd.Next(200))
                 worker.SendMultipartMessage(msg)
                 )
             poller.Run()
             log "Done."
 
         open System.Collections.Generic
-        let balancer name_self name_rest (log : string -> unit) (poller : NetMQPoller) =
-            let uri_self = uri name_self
+        let balancer name_cluster (log : string -> unit) (poller : NetMQPoller) =
+            let uri_self = uri name_cluster
             let uri' = join [uri_self; worker']
             init RouterSocket poller (bind uri') <| fun backend_local ->
             log <| sprintf "The local backend is bound to %s" uri'
-            let uri' = List.map (fun name -> join [uri name; client'; cloud]) name_rest
-            init RouterSocket poller (connect' uri') <| fun backend_cloud ->
-            log <| sprintf "The cloud backend is connected to %s" (String.concat " & " uri')
+            init RouterSocket poller (connect' []) <| fun backend_cloud ->
+            log "The cloud backend has finished init."
             backend_cloud.Options.RouterMandatory <- true
             let uri' = join [uri_self; client']
             init RouterSocket poller (bind uri') <| fun frontend_local ->
@@ -875,41 +881,58 @@ module Messaging =
             let uri' = join [uri_self; client'; cloud]
             init RouterSocket poller (bind uri') <| fun frontend_cloud ->
             log <| sprintf "The cloud frontend is bound to %s" uri'
+            init SubscriberSocket poller (connect uri_workers_available) <| fun workers_avail ->
+            workers_avail.SubscribeToAnyTopic()
+            log <| sprintf "Workers available has connected and subscribed to: %s" uri_workers_available
+            init PushSocket poller (connect uri_workers_available_push) <| fun workers_avail_push ->
+            log <| sprintf "Workers available push has connected: %s" uri_workers_available_push
 
-            let id_self = Text.Encoding.Default.GetBytes(name_self)
+            let id_self = Text.Encoding.Default.GetBytes(name_cluster)
             frontend_cloud.Options.Identity <- id_self
 
-            let id_rest = name_rest |> List.map Text.Encoding.Default.GetBytes
             let workers_cloud = Dictionary()
             let workers = Queue()
             let clients = Queue()
 
             let rnd = Random()
-            let worker_cloud_sample on_succ =
+            let worker_cloud_sample_with_replacement on_succ =
                 let dist = Seq.toArray workers_cloud
                 let dist_cdf = dist |> Array.scan (fun s x -> s + x.Value) 0
                 let max = Array.last dist_cdf
                 if max > 0 then
-                    let i = rnd.Next(max)
-                    let i = Array.findIndexBack (fun x -> i >= x) dist_cdf
-                    on_succ dist.[i].Key
+                    let id = 
+                        rnd.Next(max)
+                        |> fun from -> Array.findIndex (fun near_to -> from < near_to) dist_cdf
+                        |> fun i -> dist.[i-1].Key
+                    on_succ id
+
+            let workers_avail_switch =
+                let mutable old = workers.Count
+                fun () ->
+                    let x = workers.Count
+                    if old <> x then 
+                        let msg = NetMQMessage()
+                        msg.Append(name_cluster); msg.Append(x)
+                        workers_avail_push.SendMultipartMessage(msg)
+                        old <- x
 
             let queue_try_work () =
                 if clients.Count > 0 then
                     if workers.Count > 0 then
-                        let client : NetMQMessage = clients.Dequeue()
                         let worker : NetMQFrame = workers.Dequeue()
+                        let client : NetMQMessage = clients.Dequeue()
                         client.PushEmptyFrame()
                         client.Push(worker)
                         backend_local.SendMultipartMessage(client)
                     else
-                        worker_cloud_sample <| fun (id : NetMQFrame) ->
+                        worker_cloud_sample_with_replacement <| fun (id : string) ->
+                            log <| sprintf "Routing to %s" id
                             let client = clients.Dequeue()
                             client.PushEmptyFrame()
                             client.Push(id)
                             backend_cloud.SendMultipartMessage(client)
+                workers_avail_switch()
 
-            let print_message (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> x.ConvertToString()) |> String.concat " | " |> log
             let backend_handle (x : NetMQSocketEventArgs) =
                 let msg = x.Socket.ReceiveMultipartMessage()
                 let address = msg.Pop()
@@ -929,6 +952,17 @@ module Messaging =
                 queue_try_work()
             use __ = frontend_local.ReceiveReady.Subscribe frontend_handle
             use __ = frontend_cloud.ReceiveReady.Subscribe frontend_handle
+
+            use __ = workers_avail.ReceiveReady.Subscribe(fun x ->
+                let msg = x.Socket.ReceiveMultipartMessage()
+                let name, num = msg.[0].ConvertToString(), msg.[1].ConvertToInt32()
+                if name <> name_cluster then
+                    if workers_cloud.ContainsKey name = false then
+                        let r = join [uri name; client'; cloud]
+                        backend_cloud.Connect(r)
+                        log <| sprintf "Backend cloud has connected to: %s" r
+                    workers_cloud.[name] <- num
+                )
             poller.Run()
 
 module Lithe = 
@@ -1238,6 +1272,17 @@ module UI =
                                 balancer :: clients @ workers |> List.toArray
                             | _ -> failwith "impossible"
                             )
+                        )
+                    tab "Peering Full" (
+                        ["A"; "B"; "C"]
+                        |> List.collect (fun name ->
+                            let balancer = sprintf "Balancer %s" name, PeeringFull.balancer name
+                            let clients = List.init PeeringFull.num_clients (fun i -> sprintf "Client %s-%i" name i, PeeringFull.client name)
+                            let workers = List.init PeeringFull.num_workers (fun i -> sprintf "Worker %s-%i" name i, PeeringFull.worker name)
+                            balancer :: clients @ workers
+                            )
+                        |> fun l -> ("Publisher", PeeringFull.publisher) :: l 
+                        |> List.toArray
                         )
                     ]
                 ]
