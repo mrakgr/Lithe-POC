@@ -825,7 +825,9 @@ module Messaging =
         let cloud = "cloud"
         let num_clients = 10
         let num_workers = 3
-        let num_client_msgs = 50
+        let num_bursts = 5
+        let num_client_msgs = 20
+        let num_burst_timeout = 300
                 
         let publisher (log : string -> unit) (poller : NetMQPoller) =
             init PullSocket poller (bind uri_workers_available_push) <| fun monitor ->
@@ -840,16 +842,18 @@ module Messaging =
         let client name_cluster (log : string -> unit) (poller : NetMQPoller) =
             let uri_client = join [uri name_cluster; client']
             init RequestSocket poller (connect uri_client) <| fun client ->
-            let rec loop i =
-                if i < num_client_msgs then
+            let rnd = Random()
+            for _=1 to num_bursts do
+                let to' = rnd.Next(num_client_msgs)+1
+                for _=1 to to' do
                     let msg = task_id()
                     client.SendFrame(sprintf "task_id: %i" msg)
                     //sprintf "Sent task: %i" msg |> log
                     client.ReceiveFrameString() 
                     //|> sprintf "Got: %s" |> log
-                    loop (i+1)
-                else log "Done."
-            loop 0
+                    |> ignore
+                Thread.Sleep(rnd.Next(num_burst_timeout))
+            log "Done."
 
         let msg_ready = "READY"
         let worker name_cluster (log : string -> unit) (poller : NetMQPoller) =
@@ -860,7 +864,7 @@ module Messaging =
             let rnd = Random()
             use __ = worker.ReceiveReady.Subscribe(fun _ ->
                 let msg = worker.ReceiveMultipartMessage()
-                Thread.Sleep(rnd.Next(200))
+                Thread.Sleep(rnd.Next(20))
                 worker.SendMultipartMessage(msg)
                 )
             poller.Run()
@@ -895,7 +899,7 @@ module Messaging =
             let clients = Queue()
 
             let rnd = Random()
-            let worker_cloud_sample_with_replacement on_succ =
+            let worker_cloud_sample on_succ =
                 let dist = Seq.toArray workers_cloud
                 let dist_cdf = dist |> Array.scan (fun s x -> s + x.Value) 0
                 let max = Array.last dist_cdf
@@ -925,12 +929,15 @@ module Messaging =
                         client.Push(worker)
                         backend_local.SendMultipartMessage(client)
                     else
-                        worker_cloud_sample_with_replacement <| fun (id : string) ->
+                        worker_cloud_sample <| fun (id : string) ->
                             log <| sprintf "Routing to %s" id
-                            let client = clients.Dequeue()
-                            client.PushEmptyFrame()
-                            client.Push(id)
-                            backend_cloud.SendMultipartMessage(client)
+                            let msg = clients.Dequeue()
+                            msg.PushEmptyFrame()
+                            msg.Push(id)
+                            let rec try_send msg = // NetMQ is annoying in how connects are non-blocking. The solution is to just keep trying.
+                                try backend_cloud.SendMultipartMessage msg
+                                with :? HostUnreachableException -> Thread.Sleep(20); try_send msg
+                            try_send msg
                 workers_avail_switch()
 
             let backend_handle (x : NetMQSocketEventArgs) =
@@ -962,6 +969,7 @@ module Messaging =
                         backend_cloud.Connect(r)
                         log <| sprintf "Backend cloud has connected to: %s" r
                     workers_cloud.[name] <- num
+                    queue_try_work()
                 )
             poller.Run()
 
