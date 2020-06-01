@@ -545,7 +545,7 @@ module Messaging =
             let rnd = Random()
             for _=1 to num_tasks do
                 rnd.Next(near_to)
-                |> fun dist_i -> List.findIndexBack (fun x -> dist_i >= x) dist
+                |> fun to' -> List.findIndexBack (fun x -> x <= to') dist
                 |> fun sample_i -> workers.[sample_i]
                 |> fun x -> send x.name "This is the workload."
             for x in workers do send x.name msg_end
@@ -934,7 +934,7 @@ module Messaging =
                             let msg = clients.Dequeue()
                             msg.PushEmptyFrame()
                             msg.Push(id)
-                            let rec try_send msg = // NetMQ is annoying in how connects are non-blocking. The solution is to just keep trying.
+                            let rec try_send msg = // NetMQ is annoying in how the connects are non-blocking. The solution is to just keep trying.
                                 try backend_cloud.SendMultipartMessage msg
                                 with :? HostUnreachableException -> Thread.Sleep(20); try_send msg
                             try_send msg
@@ -972,6 +972,44 @@ module Messaging =
                     queue_try_work()
                 )
             poller.Run()
+
+    module LazyPirate =
+        let uri = "ipc://lazy_pirate"
+        let task_id = let x = ref 0 in fun () -> Interlocked.Add(x,1)
+        let timeout = TimeSpan.FromSeconds 0.5
+        let num_requests = 20
+        let num_retries = 6
+        let client (log : string -> unit) (poller : NetMQPoller) =
+            let rec loop_req i =
+                let id = task_id()
+                let rec loop_retry retries =
+                    let is_succ =
+                        init RequestSocket poller (connect uri) <| fun req ->
+                        req.SendFrame(sprintf "task %i" id)
+                        let mutable s = null
+                        if req.TryReceiveFrameString(timeout,&s) then log <| sprintf "Received: %s" s; true
+                        else log <| sprintf "Task %i timed out." id; false
+                    if is_succ then loop_req (i+1)
+                    elif retries > 0 then log "Retrying..."; loop_retry (retries-1)
+                    else log "Aborting." 
+                if i < num_requests then loop_retry num_retries
+                else log "Done."
+            loop_req 0
+                
+        let server (log : string -> unit) (poller : NetMQPoller) =
+            init ResponseSocket poller (bind uri) <| fun res ->
+            let rnd = Random()
+            let rec loop i =
+                let msg = res.ReceiveFrameString()
+                let tired = 2 < i
+                if tired && rnd.Next(8) = 0 then log "Simulating a crash." else
+                if tired && rnd.Next(3) = 0 then log "Simulating an overload."; Thread.Sleep(timeout)
+                Thread.Sleep(timeout/2.0)
+                log <| sprintf "Got: %s" msg
+                res.SendFrame(msg)
+                loop (i+1)
+
+            loop 0
 
 module Lithe = 
     open Avalonia
@@ -1292,6 +1330,10 @@ module UI =
                         |> fun l -> ("Publisher", PeeringFull.publisher) :: l 
                         |> List.toArray
                         )
+                    tab "Lazy Pirate" [|
+                        "Client", LazyPirate.client
+                        "Server", LazyPirate.server
+                        |]
                     ]
                 ]
             ]
