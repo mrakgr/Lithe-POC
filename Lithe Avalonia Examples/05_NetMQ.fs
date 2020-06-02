@@ -1007,9 +1007,8 @@ module Messaging =
             loop 0
 
     module SimplePirate =
-        let uri x = sprintf "ipc://simple_pirate/%s" x
-        let uri_frontend = uri "frontend"
-        let uri_backend = uri "backend"
+        let uri_frontend = "ipc://simple_pirate"
+        let uri_backend = "inproc://simple_pirate"
 
         let task_id = let x = ref 0 in fun () -> Interlocked.Add(x,1)
         let timeout = TimeSpan.FromSeconds 0.5
@@ -1024,13 +1023,13 @@ module Messaging =
                 let id = task_id()
                 let rec loop_retry retries =
                     let is_succ =
-                        init RequestSocket poller (connect uri_frontend) <| fun req ->
-                        req.SendFrameEmpty()
-                        req.SkipMultipartMessage()
+                        init DealerSocket poller (connect uri_frontend) <| fun req ->
                         req.SendFrame(sprintf "task %i" id)
-                        let mutable s = null
-                        if req.TryReceiveFrameString(timeout,&s) then log <| sprintf "Received: %s" s; true
-                        else log <| sprintf "Task %i timed out." id; false
+                        if req.TrySkipMultipartMessage(timeout*3.0) then // I am doing a little trick to make the send synchronous.
+                            let mutable s = null
+                            if req.TryReceiveFrameString(timeout,&s) then log <| sprintf "Received: %s" s; true
+                            else log <| sprintf "Task %i's work timed out." id; false
+                        else log <| sprintf "Task %i's send timed out." id; false
                     if is_succ then loop_req (i+1)
                     elif retries > 0 then log "Retrying..."; loop_retry (retries-1)
                     else log "Aborting." 
@@ -1047,8 +1046,8 @@ module Messaging =
                 let msg = res.ReceiveMultipartMessage()
                 let tired = 2 < i
                 //if tired && rnd.Next(8) = 0 then log "Simulating a crash." else
-                //if tired && rnd.Next(3) = 0 then log "Simulating an overload."; Thread.Sleep(timeout)
-                Thread.Sleep(rnd.Next(timeout.Milliseconds))
+                if tired && rnd.Next(3) = 0 then log "Simulating an overload."; Thread.Sleep(timeout)
+                Thread.Sleep(timeout/2.0)
                 log <| sprintf "Got: %s" (msg.Last.ConvertToString())
                 res.SendMultipartMessage(msg)
                 loop (i+1)
@@ -1074,9 +1073,8 @@ module Messaging =
                     )
                 if workers.Count > 0 then
                     in' frontend (fun _ ->
-                        frontend.SkipMultipartMessage()
-                        frontend.SendFrameEmpty()
                         let msg = frontend.ReceiveMultipartMessage()
+                        frontend.SendFrame(msg.First.Buffer,true); frontend.SendFrameEmpty()
                         msg.PushEmptyFrame()
                         msg.Push(workers.Dequeue())
                         backend.SendMultipartMessage(msg)
