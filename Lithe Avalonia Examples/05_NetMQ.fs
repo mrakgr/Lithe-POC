@@ -122,6 +122,58 @@ module Messaging =
 
         let client = client' uri
 
+    module HelloWorldPoller =
+        let msg_num = 3
+        let timeout = 1000
+        let uri = "ipc://hello-world-poller"
+        let server (log : string -> unit) (poller: NetMQPoller) =
+            use server = new ResponseSocket()
+            log <| sprintf "Server has bound to: %s" uri
+            bind uri server <| fun () ->
+            let q = NetMQSelector()
+            let items = [|
+                NetMQSelector.Item(server,PollEvents.PollIn)
+                |]
+            log <| sprintf "Pre-loop: %b" server.HasIn // false
+            while q.Select(items,items.Length,-1L) do
+                log <| sprintf "In-loop: %b" server.HasIn // true
+                let x = server.ReceiveFrameString()
+                log <| sprintf "Mid-loop: %b" server.HasIn // false
+                log (sprintf "Server received %s" x)
+                Thread.Sleep(timeout)
+                let msg = sprintf "%s World" x
+                log (sprintf "Server sending %s" msg)
+                server.SendFrame(msg)
+            log "Done."
+            //try init ResponseSocket poller (bind uri) <| fun server ->
+            //    log <| sprintf "Server has bound to: %s" uri
+                
+            //    use __ = server.ReceiveReady.Subscribe(fun x ->
+            //        )
+            //    poller.Run()
+            //with e -> log e.Message
+
+        let client' uri (log : string -> unit) (poller: NetMQPoller)  =
+            try init RequestSocket poller (connect uri) <| fun client ->
+                log <| sprintf "Client has connected to: %s" uri
+                let i = ref 0
+                use __ = client.SendReady.Subscribe(fun _ -> 
+                    if !i < msg_num then
+                        let msg = "Hello"
+                        msg |> sprintf "Client sending %s" |> log 
+                        client.SendFrame(msg)
+                        incr i
+                    else 
+                        poller.Stop()
+                    )
+                use __ = client.ReceiveReady.Subscribe(fun _ -> 
+                    client.ReceiveFrameString() |> sprintf "Client received %s" |> log
+                    )
+                poller.Run()
+            with e -> log e.Message
+
+        let client = client' uri
+
     module Weather =
         let uri = "ipc://weather"
         let server (log : string -> unit) (poller : NetMQPoller) =
@@ -1426,6 +1478,10 @@ module UI =
                         let workers = List.init SimplePirate.num_workers (fun i -> sprintf "Worker %i" i, SimplePirate.worker)
                         balancer :: clients @ workers |> List.toArray
                         )
+                    tab "Hello World Poller" [|
+                        "Client", HelloWorldPoller.client
+                        "Server", HelloWorldPoller.server
+                        |]
                     ]
                 ]
             ]
