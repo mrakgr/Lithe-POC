@@ -11,8 +11,9 @@
     <Compile Include="01_BasicLayouts.fs" />
     <Compile Include="02_Counter.fs" />
     <Compile Include="03_StackButtons.fs" />
-    <Compile Include="04_ZeroMQ_HelloWorld.fs" />
-    <Compile Include="05_ZeroMQ.fs" />
+    <Compile Include="04_NetMQ_HelloWorld.fs" />
+    <Compile Include="05_NetMQ.fs" />
+    <Compile Include="06_ZeroMQ.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
 

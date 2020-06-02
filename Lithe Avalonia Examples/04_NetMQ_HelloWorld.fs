@@ -4,7 +4,7 @@
 
 // Here a broad range of reactive combinator functionality is being demonstrated in the context of doing GUIs.
 // In addition to that, how to start and dispose NetMQ servers and clients is demonstrated.
-module Avalonia.ZeroMQHelloWorld
+module Avalonia.NetMQHelloWorld
 
 module Lithe = 
     open Avalonia
