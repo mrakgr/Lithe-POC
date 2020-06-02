@@ -26,23 +26,13 @@ module Messaging =
     module NetMQPoller =
         let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
         let inline add_timer (poller : NetMQPoller) (socket : NetMQTimer) rest = (socket, rest) ||> t poller.Add poller.Remove
-        let poll_index' (items : NetMQSelector.Item []) (t : TimeSpan) =
-            if NetMQSelector().Select(items,items.Length,t.Ticks) then
-                items |> Array.findIndex (fun x -> x.ResultEvent <> PollEvents.None)
-            else
-                -1
 
-        let poll_index (items : NetMQSelector.Item []) = poll_index' items (TimeSpan(-1L))
+        let poll' (items : (NetMQSelector.Item * (NetMQSocket -> unit)) []) (t : TimeSpan) = 
+            let b = NetMQSelector().Select(Array.map fst items,items.Length,t.Ticks)
+            if b then items |> Array.iter (fun (s,f) -> if s.ResultEvent <> PollEvents.None then f s.Socket)
+            b
 
-        let poll' (items : (NetMQSelector.Item * (NetMQSocket -> unit)) []) (t : TimeSpan) =
-            let i = poll_index' (Array.map fst items) t
-            if i <> -1 then
-                let s,f = items.[i]
-                f s.Socket
-                true
-            else false
-
-        let poll (items : (NetMQSelector.Item * (NetMQSocket -> unit)) []) = poll' items (TimeSpan(-1L))
+        let poll items = poll' items (TimeSpan -1L)
 
     module NetMQSocket =
         let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
@@ -116,47 +106,6 @@ module Messaging =
                     )
                 poller.Run()
             with e -> log e.Message
-
-        let client' uri (log : string -> unit) (poller: NetMQPoller)  =
-            try init RequestSocket poller (connect uri) <| fun client ->
-                log <| sprintf "Client has connected to: %s" uri
-                let i = ref 0
-                use __ = client.SendReady.Subscribe(fun _ -> 
-                    if !i < msg_num then
-                        let msg = "Hello"
-                        msg |> sprintf "Client sending %s" |> log 
-                        client.SendFrame(msg)
-                        incr i
-                    else 
-                        poller.Stop()
-                    )
-                use __ = client.ReceiveReady.Subscribe(fun _ -> 
-                    client.ReceiveFrameString() |> sprintf "Client received %s" |> log
-                    )
-                poller.Run()
-            with e -> log e.Message
-
-        let client = client' uri
-
-    module HelloWorldPoller =
-        let msg_num = 3
-        let timeout = 1000
-        let uri = "ipc://hello-world-poller"
-        let server (log : string -> unit) (poller: NetMQPoller) =
-            use server = new ResponseSocket()
-            log <| sprintf "Server has bound to: %s" uri
-            bind uri server <| fun () ->
-            let items = [|
-                NetMQSelector.Item(server,PollEvents.PollIn), fun _ ->
-                    let x = server.ReceiveFrameString()
-                    log (sprintf "Server received %s" x)
-                    Thread.Sleep(timeout)
-                    let msg = sprintf "%s World" x
-                    log (sprintf "Server sending %s" msg)
-                    server.SendFrame(msg)
-                |]
-            while NetMQPoller.poll items do ()
-            log "Done."
 
         let client' uri (log : string -> unit) (poller: NetMQPoller)  =
             try init RequestSocket poller (connect uri) <| fun client ->
@@ -1069,11 +1018,15 @@ module Messaging =
         let num_clients = 10
         let num_workers = 3
         let client (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(1000)
+            let rnd = Random()
             let rec loop_req i =
                 let id = task_id()
                 let rec loop_retry retries =
                     let is_succ =
                         init RequestSocket poller (connect uri_frontend) <| fun req ->
+                        req.SendFrameEmpty()
+                        req.SkipMultipartMessage()
                         req.SendFrame(sprintf "task %i" id)
                         let mutable s = null
                         if req.TryReceiveFrameString(timeout,&s) then log <| sprintf "Received: %s" s; true
@@ -1081,7 +1034,7 @@ module Messaging =
                     if is_succ then loop_req (i+1)
                     elif retries > 0 then log "Retrying..."; loop_retry (retries-1)
                     else log "Aborting." 
-                if i < num_requests then loop_retry num_retries
+                if i < num_requests then loop_retry (num_retries + rnd.Next(num_retries))
                 else log "Done."
             loop_req 0
 
@@ -1095,53 +1048,41 @@ module Messaging =
                 let tired = 2 < i
                 //if tired && rnd.Next(8) = 0 then log "Simulating a crash." else
                 //if tired && rnd.Next(3) = 0 then log "Simulating an overload."; Thread.Sleep(timeout)
-                Thread.Sleep(timeout/2.0)
+                Thread.Sleep(rnd.Next(timeout.Milliseconds))
                 log <| sprintf "Got: %s" (msg.Last.ConvertToString())
                 res.SendMultipartMessage(msg)
                 loop (i+1)
 
             loop 0
 
-
-        open System.Collections.Generic
-
-        // Unfortunately, using two queues leads to stale requests remaining in the queues which leads to excessive aborts.
-        // See: https://stackoverflow.com/questions/62149865/is-there-a-way-to-do-zeromq-style-polling-in-netmq
-        // At this point I am considering just ditching NetMQ and trying out the ZeroMQ bindings.
         let balancer (log : string -> unit) (poller : NetMQPoller) =
             init RouterSocket poller (bind uri_frontend) <| fun frontend ->
             log <| sprintf "Frontend has connected to %s" uri_frontend
             init RouterSocket poller (bind uri_backend) <| fun backend ->
             log <| sprintf "Backend has connected to %s" uri_backend
 
-            let workers = Queue()
-            let clients = Queue()
+            let workers = System.Collections.Generic.Queue()
 
-            let queue_try_work () =
-                if clients.Count > 0 && workers.Count > 0 then
-                    let client : NetMQMessage = clients.Dequeue()
-                    let worker : NetMQFrame = workers.Dequeue()
-                    client.PushEmptyFrame()
-                    client.Push(worker)
-                    backend.SendMultipartMessage(client)
-
-            use __ = frontend.ReceiveReady.Subscribe(fun x ->
-                let msg = x.Socket.ReceiveMultipartMessage()
-                clients.Enqueue(msg)
-                queue_try_work()
-                )
-            use __ = backend.ReceiveReady.Subscribe(fun x ->
-                let msg = x.Socket.ReceiveMultipartMessage()
-                let address = msg.Pop()
-                msg.Pop() |> ignore
-                match msg.FrameCount / 2 with
-                | 0 -> () // ready
-                | _ -> frontend.SendMultipartMessage(msg) // local message
-                workers.Enqueue(address)
-                queue_try_work()
-                )
-            poller.Run()
-
+            let in' (s : NetMQSocket) f = NetMQSelector.Item(s,PollEvents.PollIn), f
+            let items () = [|
+                in' backend (fun _ ->
+                    let msg = backend.ReceiveMultipartMessage()
+                    let address = msg.Pop()
+                    msg.Pop() |> ignore
+                    if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
+                    workers.Enqueue address
+                    )
+                if workers.Count > 0 then
+                    in' frontend (fun _ ->
+                        frontend.SkipMultipartMessage()
+                        frontend.SendFrameEmpty()
+                        let msg = frontend.ReceiveMultipartMessage()
+                        msg.PushEmptyFrame()
+                        msg.Push(workers.Dequeue())
+                        backend.SendMultipartMessage(msg)
+                        )
+                |]
+            while NetMQPoller.poll (items ()) do ()
 
 module Lithe = 
     open Avalonia
@@ -1349,10 +1290,6 @@ module UI =
                     tab "Hello World" [|
                         "Server", HelloWorld.server
                         "Client", HelloWorld.client
-                        |]
-                    tab "Hello World Poller" [|
-                        "Client", HelloWorldPoller.client
-                        "Server", HelloWorldPoller.server
                         |]
                     tab "Weather" [|
                         "Server", Weather.server
