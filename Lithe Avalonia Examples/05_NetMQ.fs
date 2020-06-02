@@ -11,7 +11,6 @@ module Messaging =
     open NetMQ.Sockets
     open System.Reactive.Disposables
 
-
     let run l =
         let l = l |> Array.map (fun f -> 
             let poller = new NetMQPoller()
@@ -27,6 +26,23 @@ module Messaging =
     module NetMQPoller =
         let inline add (poller : NetMQPoller) (socket : ISocketPollable) rest = (socket, rest) ||> t poller.Add poller.Remove
         let inline add_timer (poller : NetMQPoller) (socket : NetMQTimer) rest = (socket, rest) ||> t poller.Add poller.Remove
+        let poll_index' (items : NetMQSelector.Item []) (t : TimeSpan) =
+            if NetMQSelector().Select(items,items.Length,t.Ticks) then
+                items |> Array.findIndex (fun x -> x.ResultEvent <> PollEvents.None)
+            else
+                -1
+
+        let poll_index (items : NetMQSelector.Item []) = poll_index' items (TimeSpan(-1L))
+
+        let poll' (items : (NetMQSelector.Item * (NetMQSocket -> unit)) []) (t : TimeSpan) =
+            let i = poll_index' (Array.map fst items) t
+            if i <> -1 then
+                let s,f = items.[i]
+                f s.Socket
+                true
+            else false
+
+        let poll (items : (NetMQSelector.Item * (NetMQSocket -> unit)) []) = poll' items (TimeSpan(-1L))
 
     module NetMQSocket =
         let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
@@ -130,28 +146,17 @@ module Messaging =
             use server = new ResponseSocket()
             log <| sprintf "Server has bound to: %s" uri
             bind uri server <| fun () ->
-            let q = NetMQSelector()
             let items = [|
-                NetMQSelector.Item(server,PollEvents.PollIn)
+                NetMQSelector.Item(server,PollEvents.PollIn), fun _ ->
+                    let x = server.ReceiveFrameString()
+                    log (sprintf "Server received %s" x)
+                    Thread.Sleep(timeout)
+                    let msg = sprintf "%s World" x
+                    log (sprintf "Server sending %s" msg)
+                    server.SendFrame(msg)
                 |]
-            log <| sprintf "Pre-loop: %b" server.HasIn // false
-            while q.Select(items,items.Length,-1L) do
-                log <| sprintf "In-loop: %b" server.HasIn // true
-                let x = server.ReceiveFrameString()
-                log <| sprintf "Mid-loop: %b" server.HasIn // false
-                log (sprintf "Server received %s" x)
-                Thread.Sleep(timeout)
-                let msg = sprintf "%s World" x
-                log (sprintf "Server sending %s" msg)
-                server.SendFrame(msg)
+            while NetMQPoller.poll items do ()
             log "Done."
-            //try init ResponseSocket poller (bind uri) <| fun server ->
-            //    log <| sprintf "Server has bound to: %s" uri
-                
-            //    use __ = server.ReceiveReady.Subscribe(fun x ->
-            //        )
-            //    poller.Run()
-            //with e -> log e.Message
 
         let client' uri (log : string -> unit) (poller: NetMQPoller)  =
             try init RequestSocket poller (connect uri) <| fun client ->
@@ -647,43 +652,32 @@ module Messaging =
             poller.Run()
             log "Done."
 
-        open System.Collections.Generic
         let balancer (log : string -> unit) (poller : NetMQPoller) =
             init RouterSocket poller (bind uri_worker) <| fun backend ->
             log <| sprintf "The backend is bound to %s" uri_worker
             init RouterSocket poller (bind uri_client) <| fun frontend ->
             log <| sprintf "The frontend is bound to %s" uri_client
             
-            // Note: Using this pattern got me into trouble on the peering example.
-            // It seems to be fine on this example, but on other cases it can run into data race issues
-            // with dequeue being called on the empty worker queue.
-            let switch_frontend = 
-                poller.Remove(frontend)
-                let mutable old = false
-                fun x -> 
-                    if old <> x then
-                        if x then poller.Add(frontend)
-                        else poller.Remove(frontend)
-                        old <- x
+            let workers = System.Collections.Generic.Queue()
 
-            let workers = Queue()
-            let enqueue x = workers.Enqueue(x); switch_frontend true
-            let dequeue () = let x = workers.Dequeue() in switch_frontend(workers.Count > 0); x
-
-            use __ = backend.ReceiveReady.Subscribe(fun _ ->
-                let msg = backend.ReceiveMultipartMessage()
-                let address = msg.Pop()
-                msg.Pop() |> ignore
-                if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
-                enqueue address
-                )
-            use __ = frontend.ReceiveReady.Subscribe(fun _ ->
-                let msg = frontend.ReceiveMultipartMessage()
-                msg.PushEmptyFrame()
-                msg.Push(dequeue())
-                backend.SendMultipartMessage(msg)
-                )
-            poller.Run()
+            let in' (s : NetMQSocket) f = NetMQSelector.Item(s,PollEvents.PollIn), f
+            let items () = [|
+                in' backend (fun _ ->
+                    let msg = backend.ReceiveMultipartMessage()
+                    let address = msg.Pop()
+                    msg.Pop() |> ignore
+                    if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
+                    workers.Enqueue address
+                    )
+                if workers.Count > 0 then
+                    in' frontend (fun _ ->
+                        let msg = frontend.ReceiveMultipartMessage()
+                        msg.PushEmptyFrame()
+                        msg.Push(workers.Dequeue())
+                        backend.SendMultipartMessage(msg)
+                        )
+                |]
+            while NetMQPoller.poll (items ()) do ()
 
     module AsyncServer =
         let uri_client = "ipc://random_server"
@@ -1356,6 +1350,10 @@ module UI =
                         "Server", HelloWorld.server
                         "Client", HelloWorld.client
                         |]
+                    tab "Hello World Poller" [|
+                        "Client", HelloWorldPoller.client
+                        "Server", HelloWorldPoller.server
+                        |]
                     tab "Weather" [|
                         "Server", Weather.server
                         "Client 1", Weather.client "10001"
@@ -1478,10 +1476,6 @@ module UI =
                         let workers = List.init SimplePirate.num_workers (fun i -> sprintf "Worker %i" i, SimplePirate.worker)
                         balancer :: clients @ workers |> List.toArray
                         )
-                    tab "Hello World Poller" [|
-                        "Client", HelloWorldPoller.client
-                        "Server", HelloWorldPoller.server
-                        |]
                     ]
                 ]
             ]
