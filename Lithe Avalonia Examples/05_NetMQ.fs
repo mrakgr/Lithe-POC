@@ -86,7 +86,7 @@ module Messaging =
             receiver.SendFrame(x)
 
     module NetMQMessage =
-        let show (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> x.ConvertToString()) |> String.concat " | "
+        let show (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> if x.IsEmpty then "<null>" else x.ConvertToString()) |> String.concat " | "
 
     module HelloWorld =
         let msg_num = 3
@@ -1025,7 +1025,10 @@ module Messaging =
                     let is_succ =
                         init DealerSocket poller (connect uri_frontend) <| fun req ->
                         req.SendFrame(sprintf "task %i" id)
-                        if req.TrySkipMultipartMessage(timeout*3.0) then // I am doing a little trick to make the send synchronous.
+                        // I am doing a little trick to make the send synchronous.
+                        // I thought that the previous version of the balancer which used two queues was async due to
+                        // the receives being done prematurely, but that turned out to be a false assumption.
+                        if req.TrySkipMultipartMessage(timeout*3.0) then 
                             let mutable s = null
                             if req.TryReceiveFrameString(timeout,&s) then log <| sprintf "Received: %s" s; true
                             else log <| sprintf "Task %i's work timed out." id; false
