@@ -1085,6 +1085,54 @@ module Messaging =
                 |]
             while NetMQPoller.poll (items ()) do ()
 
+    module ParanoidPirate =
+        open MBrace.FsPickler
+        let bin = BinarySerializer()
+        let uri_frontend = "ipc://paranoid_pirate"
+        let uri_backend = "inproc://paranoid_pirate"
+
+        let task_id = let x = ref 0 in fun () -> Interlocked.Add(x,1)
+        let timeout = TimeSpan.FromSeconds 0.5
+        let num_requests = 20
+        let num_retries = 6
+        let num_clients = 10
+        let num_workers = 3
+        let client (log : string -> unit) (poller : NetMQPoller) =
+            init DealerSocket poller (connect uri_frontend) <| fun req ->
+            Thread.Sleep(1000)
+            let rec loop_req i =
+                if i < num_requests then 
+                    let id = task_id()
+                    let msg = sprintf "task %i" id
+                    let rec loop_retry retries =
+                        let is_succ =
+                            req.SendFrame(msg)
+                            let mutable s = null
+                            let rec receive () =
+                                if req.TryReceiveFrameString(timeout,&s) then 
+                                    if s = msg then log <| sprintf "Received: %s" s; true
+                                    else receive()
+                                else log <| sprintf "Task %i timed out." id; false
+                            receive()
+                        if is_succ then loop_req (i+1)
+                        elif retries > 0 then log "Retrying..."; loop_retry (retries-1)
+                        else log "Aborting." 
+                    loop_retry num_retries
+                else log "Done."
+            loop_req 0
+
+        type WorkerMsg =
+            | Ready
+            | ClientTaskDone of string
+
+        type BalancerToWorkerMsg =
+            | Restart
+            | ClientTask of string
+
+        type WorkerState =
+            | Running
+            | Crashed
+
 module Lithe = 
     open Avalonia
     open Avalonia.Controls
