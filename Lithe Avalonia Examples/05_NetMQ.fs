@@ -1094,6 +1094,10 @@ module Messaging =
                 |]
             while NetMQPoller.poll (items ()) do ()
 
+    // This example is incomplete because it is a huge mess and I do not feel like doing it.
+    // Rather than implementing heartbeating for workers, it makes more sense for the workers to restart themselves and reconnect.
+    // Basically, it makes no sense to me in the context of how the example was structured.
+    // Let me move to the next thing.
     module ParanoidPirate =
         open MBrace.FsPickler
         let bin = BinarySerializer()
@@ -1525,12 +1529,12 @@ module UI =
                         let workers = List.init SimplePirate.num_workers (fun i -> sprintf "Worker %i" i, SimplePirate.worker)
                         balancer :: clients @ workers |> List.toArray
                         )
-                    tab "Paranoid Pirate" (
-                        let balancer = sprintf "Balancer", ParanoidPirate.balancer
-                        let clients = List.init ParanoidPirate.num_clients (fun i -> sprintf "Client %i" i, ParanoidPirate.client)
-                        let workers = List.init ParanoidPirate.num_workers (fun i -> sprintf "Worker %i" i, ParanoidPirate.worker)
-                        balancer :: clients @ workers |> List.toArray
-                        )
+                    //tab "Paranoid Pirate" (
+                    //    let balancer = sprintf "Balancer", ParanoidPirate.balancer
+                    //    let clients = List.init ParanoidPirate.num_clients (fun i -> sprintf "Client %i" i, ParanoidPirate.client)
+                    //    let workers = List.init ParanoidPirate.num_workers (fun i -> sprintf "Worker %i" i, ParanoidPirate.worker)
+                    //    balancer :: clients @ workers |> List.toArray
+                    //    )
                     ]
                 ]
             ]
