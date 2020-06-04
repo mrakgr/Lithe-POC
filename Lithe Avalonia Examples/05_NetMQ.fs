@@ -36,8 +36,11 @@ module Messaging =
 
     module NetMQSocket =
         let inline bind uri (socket : NetMQSocket) rest = t socket.Bind socket.Unbind uri rest
-        let inline connect uri (socket : NetMQSocket) rest = t socket.Connect socket.Disconnect uri rest
-        let inline connect' uri (socket : NetMQSocket) rest = t (List.iter socket.Connect) (List.rev >> List.iter socket.Disconnect) uri rest
+        let rec loop_connect (socket : NetMQSocket) x =
+            try socket.Connect(x) 
+            with :? EndpointNotFoundException -> Thread.Sleep(20); loop_connect socket x
+        let inline connect uri (socket : NetMQSocket) rest = t (loop_connect socket) socket.Disconnect uri rest
+        let inline connect' uri (socket : NetMQSocket) rest = t (List.iter (loop_connect socket)) (List.rev >> List.iter socket.Disconnect) uri rest
         let inline init (socket_create : unit -> #NetMQSocket) (poller : NetMQPoller) (connector : #NetMQSocket -> (unit -> 'r) -> 'r) rest =
             use socket = socket_create()
             NetMQPoller.add poller socket <| fun () ->
@@ -87,6 +90,12 @@ module Messaging =
 
     module NetMQMessage =
         let show (msg : NetMQMessage) = Seq.toArray msg |> Array.map (fun x -> if x.IsEmpty then "<null>" else x.ConvertToString()) |> String.concat " | "
+        let equals (a : NetMQMessage) (b : NetMQMessage) = Seq.forall2 (fun (a : NetMQFrame) (b : NetMQFrame) -> a.Buffer = b.Buffer) a b
+        /// Does a shallow copy of the message.
+        let copy (msg : NetMQMessage) =
+            let x = NetMQMessage(msg.FrameCount)
+            for d in msg do x.Append(d)
+            x
 
     module HelloWorld =
         let msg_num = 3
@@ -1098,8 +1107,8 @@ module Messaging =
         let num_clients = 10
         let num_workers = 3
         let client (log : string -> unit) (poller : NetMQPoller) =
+            Thread.Sleep(500)
             init DealerSocket poller (connect uri_frontend) <| fun req ->
-            Thread.Sleep(1000)
             let rec loop_req i =
                 if i < num_requests then 
                     let id = task_id()
@@ -1111,7 +1120,7 @@ module Messaging =
                             let rec receive () =
                                 if req.TryReceiveFrameString(timeout,&s) then 
                                     if s = msg then log <| sprintf "Received: %s" s; true
-                                    else receive()
+                                    else log <| sprintf "Received invalid: %s" s; receive()
                                 else log <| sprintf "Task %i timed out." id; false
                             receive()
                         if is_succ then loop_req (i+1)
@@ -1123,7 +1132,7 @@ module Messaging =
 
         type WorkerMsg =
             | Ready
-            | ClientTaskDone of string
+            | ClientTaskDone of string * string
 
         type BalancerToWorkerMsg =
             | Restart
@@ -1132,6 +1141,60 @@ module Messaging =
         type WorkerState =
             | Running
             | Crashed
+
+        let worker (log : string -> unit) (poller : NetMQPoller) =
+            init RequestSocket poller (connect uri_backend) <| fun res ->
+            res.SendFrameEmpty()
+            log "Ready"
+            let rnd = Random()
+            let rec loop i =
+                let msg = res.ReceiveMultipartMessage()
+                let tired = 2 < i
+                //if tired && rnd.Next(8) = 0 then log "Simulating a crash." else
+                if tired && rnd.Next(3) = 0 then log "Simulating an overload."; Thread.Sleep(timeout)
+                Thread.Sleep(timeout/2.0)
+                log <| sprintf "Got: %s" (msg.Last.ConvertToString())
+                res.SendMultipartMessage(msg)
+                loop (i+1)
+
+            loop 0
+
+        let balancer (log : string -> unit) (poller : NetMQPoller) =
+            init RouterSocket poller (bind uri_frontend) <| fun frontend ->
+            log <| sprintf "Frontend has connected to %s" uri_frontend
+            init RouterSocket poller (bind uri_backend) <| fun backend ->
+            log <| sprintf "Backend has connected to %s" uri_backend
+
+            let users_prev_requests = System.Collections.Generic.Dictionary()
+            let workers_time = System.Collections.Generic.Dictionary()
+            let clients = System.Collections.Generic.Queue()
+            let workers = System.Collections.Generic.Queue()
+
+            let in' (s : NetMQSocket) f = NetMQSelector.Item(s,PollEvents.PollIn), f
+            let items () = [|
+                in' backend (fun _ ->
+                    let msg = backend.ReceiveMultipartMessage()
+                    let address = msg.Pop()
+                    msg.Pop() |> ignore
+                    if msg.FrameCount > 1 then frontend.SendMultipartMessage(msg)
+                    workers.Enqueue address
+                    )
+                if workers.Count > 0 then
+                    in' frontend (fun _ ->
+                        let msg = frontend.ReceiveMultipartMessage()
+                        let address = msg.Pop()
+                        match users_prev_requests.TryGetValue(address) with
+                        | true, v when NetMQMessage.equals msg v -> ()
+                        | _ ->
+                            users_prev_requests.[address] <- NetMQMessage.copy msg
+                            msg.Push(address)
+                            msg.PushEmptyFrame()
+                            msg.Push(workers.Dequeue())
+                            backend.SendMultipartMessage(msg)
+                        )
+                |]
+            while NetMQPoller.poll (items ()) do ()
+
 
 module Lithe = 
     open Avalonia
@@ -1460,6 +1523,12 @@ module UI =
                         let balancer = sprintf "Balancer", SimplePirate.balancer
                         let clients = List.init SimplePirate.num_clients (fun i -> sprintf "Client %i" i, SimplePirate.client)
                         let workers = List.init SimplePirate.num_workers (fun i -> sprintf "Worker %i" i, SimplePirate.worker)
+                        balancer :: clients @ workers |> List.toArray
+                        )
+                    tab "Paranoid Pirate" (
+                        let balancer = sprintf "Balancer", ParanoidPirate.balancer
+                        let clients = List.init ParanoidPirate.num_clients (fun i -> sprintf "Client %i" i, ParanoidPirate.client)
+                        let workers = List.init ParanoidPirate.num_workers (fun i -> sprintf "Worker %i" i, ParanoidPirate.worker)
                         balancer :: clients @ workers |> List.toArray
                         )
                     ]
