@@ -57,6 +57,8 @@
 // tool to do it.
 
 // Addendum: I had no idea that FsNetMQ existed either. That might have been good to have.
+// https://zeromq.org/languages/fsharp/
+// There are some code samples here, including a way of using the actor that I was not aware of before.
 
 module Avalonia.NetMQ
 
