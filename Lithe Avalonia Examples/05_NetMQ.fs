@@ -1,4 +1,62 @@
-﻿module Avalonia.NetMQ
+﻿// 6/5/2020: Since I am done with this, let me put in a few words.
+// Originally when I started this, I had the intention of making every example restartable.
+// If you look at the first hello world example you will see that unlike in the book, it does
+// polling. There are a few problems with this.
+
+// When I was starting out on this, I actually did not know that unlike with .NET `Task`s
+// it is possible to abort threads. Had I known that from the start, I'd have gone for a
+// different design. Even though `Messaging.run` now uses threads rather than tasks, it has 
+// not been redesigned to take advantage of the addition capability of using raw threads.
+// Calling `abort` on a thread would have been a lot more reliable than calling stop on the 
+// poller passed into the function.
+
+// Another problem is with the library itself. It is easy to open a socket, it easy to close
+// it, but doing that on repeat is very difficult. Specifically, the NetMQ library does all
+// binds and connects asynchronously as well unbinds and disconnects. Bind, unbind and bind
+// the socket to the same address and you will get runtime errors, synchronization problems
+// and dropped messages even for supposedly reliable sockets. It worked on me on the first 
+// example, so I thought it would do fine on the rest, but I was wrong. I opened several issues 
+// on the NetMQ issues pages and most of them are restart related. So even though every tab has
+// that big restart button at the top consider it broken. At first I endeavored to make all
+// the examples restartable, but all the bugs I've run into made me deviate from that goal.
+
+// Lastly, I had no idea that it was possible to do ZeroMQ style polling until the end. Had
+// I known that from the start, I'd have used that to make the examples more idiomatic. Check
+// out the `poll` and `poll'` extensions in the `NetMQPoller` module and their references for
+// examples.
+
+// Problems with the UI:
+// The UI features a fairly inspired reactive design. Unfortunately, I had the bright idea of
+// adding every line as two text block controls. My reasoning was that I did not want to constantly
+// keep having to regenerate the string, but what I did not count on was that even a moderately large 
+// amount of lines would grind the UI to halt. You can see that effect on examples that run for long.
+
+// It would have been better to use a single control for text. As a benefit it would have allowed
+// me to keep the UI itself a pure function of the state. Right now, it is being mutated directly.
+// It was an interesting experiment in UI library design, but I made the wrong choice here.
+
+// Also, had I known how much trouble the restarts were going to be, I'd have given every thread
+// its own cancel button in the UI. I mentioned that the issues with restarts crop up because the 
+// rebind is too fast. If the restarts were done by hand on individual threads, there would be 
+// enough lag so that things work properly. It would have been better if the top level button was a 
+// switch rather than doing the restart immediately on click.
+
+// What I wrote in the first section makes NetMQ look bad, but ironically these kinds of 
+// issues would only crop up on toy examples like these. Using NetMQ in the real world, you would not 
+// restart the servers while the process is still running and so would never run into them.
+
+// Conclusion:
+// I've done the examples from the first third of the book up to paranoid pirate (which is unfinished).
+// Beyond that point, they get pretty complicated and are overkill for what I want to use NetMQ for so 
+// I do not have the time nor the interest to pursue them anymore. If anybody is interested in learning 
+// both ZeroMQ and UIs, it would be a good exercise to pick up where I left off by redesigning everything 
+// in this file so that all the criticisms in this text are addressed.
+
+// As for me, I'll get to work on editor support for Spiral starting with getting messaging to work between
+// Node and .NET. I've been looking forward to that since February and I finally have the skills and the 
+// tool to do it.
+
+module Avalonia.NetMQ
 
 open System
 open System.Threading
